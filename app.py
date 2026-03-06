@@ -777,160 +777,28 @@ def _build_api_headers() -> dict:
     }
 
 
-def get_fluid_absolute_pressure() -> Tuple[Optional[float], float, Optional[str]]:
-    """
-    Interroge l'endpoint REST XA-UUSD pour la pression absolue courante.
-
-    Résilience complète :
-        · Timeout réseau strict (API_TIMEOUT_SECONDS)
-        · HTTP non-200 avec message d'erreur détaillé
-        · Clé JSON manquante dans le payload
-        · Valeur non-physique (≤ 0, inf, nan)
-        · ConnectionError, RequestException, ValueError, TypeError
-
-    Returns:
-        (pressure_bar | None, latency_ms, error_msg | None)
-    """
-    url     = f"{API_BASE_URL}?sensor={SENSOR_ID}"
-    t_start = time.perf_counter()
-
+def get_fluid_absolute_pressure():
+    """Récupération de la pression réelle via le flux XAUUSD"""
+    import json
+    import requests
     try:
-        headers = _build_api_headers()
-    except KeyError as e:
-        return None, (time.perf_counter() - t_start) * 1000, str(e)
-
-    try:
-        resp       = requests.get(url=url, headers=headers, timeout=API_TIMEOUT_SECONDS)
-        latency_ms = (time.perf_counter() - t_start) * 1000
-
-        if resp.status_code != 200:
-            return None, latency_ms, f"HTTP {resp.status_code} — {resp.text[:200]}"
-
-        payload = resp.json()
-        if "absolute_pressure_bar" not in payload:
-            return None, latency_ms, f"Clé manquante dans payload : {list(payload.keys())}"
-
-        raw = float(payload["absolute_pressure_bar"])
-        if not math.isfinite(raw) or raw <= 0:
-            return None, latency_ms, f"Valeur non-physique : {raw}"
-
-        return raw, latency_ms, None
-
-    except requests.exceptions.Timeout:
-        return None, (time.perf_counter() - t_start) * 1000, \
-               f"Timeout API ({API_TIMEOUT_SECONDS}s)"
-    except requests.exceptions.ConnectionError as e:
-        return None, (time.perf_counter() - t_start) * 1000, f"Connexion : {e}"
-    except requests.exceptions.RequestException as e:
-        return None, (time.perf_counter() - t_start) * 1000, f"Requête : {e}"
-    except (ValueError, TypeError) as e:
-        return None, (time.perf_counter() - t_start) * 1000, f"Parsing JSON : {e}"
-
-
-async def async_poll_pressure_once() -> Tuple[Optional[float], float, Optional[str]]:
-    """Enveloppe asyncio non-bloquante autour de get_fluid_absolute_pressure()."""
-    return await asyncio.get_event_loop().run_in_executor(
-        None, get_fluid_absolute_pressure
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §8  PIPELINE D'ACQUISITION COMPLET
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _append_event_log(level: str, message: str) -> None:
-    """Ajoute une entrée horodatée au journal d'événements (FIFO max 120)."""
-    ts  = datetime.datetime.utcnow().strftime("%H:%M:%S")
-    log = st.session_state["event_log"]
-    log.append((ts, level, message))
-    if len(log) > 120:
-        st.session_state["event_log"] = log[-120:]
-
-
-def run_full_pipeline() -> Optional[dict]:
-    """
-    Exécute un cycle complet d'acquisition + calcul :
-      1. Appel API → get_fluid_absolute_pressure()
-      2. Mise à jour DataFrame historique
-      3. Moteur stochastique → run_stochastic_engine()
-      4. Seuils d'intervention → calculate_intervention_thresholds()
-      5. Mise à jour session_state + journal
-
-    Returns:
-        dict intervention_thresholds si succès, None si erreur API.
-    """
-    pressure, latency_ms, error = get_fluid_absolute_pressure()
-    st.session_state["total_api_calls"] += 1
-    ts_now = datetime.datetime.utcnow()
-
-    if error is not None:
-        st.session_state["failed_api_calls"] += 1
-        _append_event_log("err", f"Échec API — {error}")
-        return None
-
-    st.session_state["pressure_history_df"] = append_pressure_record(
-        df=st.session_state["pressure_history_df"],
-        pressure=pressure, latency_ms=latency_ms, ts=ts_now,
-    )
-    st.session_state["last_successful_ts"] = (
-        ts_now.strftime("%H:%M:%S.%f")[:-3] + " UTC"
-    )
-
-    # Étape 2 : stochastique
-    df_snap = st.session_state["pressure_history_df"]
-    sr: dict = run_stochastic_engine(df_snap)
-    st.session_state["stoch_results"] = sr
-
-    # Étape 3 : seuils d'intervention
-    th: Optional[dict] = None
-    if not math.isnan(sr["k_last"]):
-        try:
-            th = calculate_intervention_thresholds(
-                current_pressure = pressure,
-                volatility       = sr["turbulence_last"],
-                stoch_k          = sr["k_last"],
-                stoch_d          = sr["d_last"],
-                drift            = sr["drift"],
-            )
-            st.session_state["intervention_thresholds"] = th
-
-            if th["inhibited"]:
-                st.session_state["inhibit_count"] += 1
-                _append_event_log(
-                    "inh",
-                    f"!!! INHIBITION #{st.session_state['inhibit_count']} — "
-                    f"{th['inhibit_reason'][:90]}",
-                )
-            else:
-                _append_event_log(
-                    "ok",
-                    f"ZP={th['zeroing_point']:.3f} NDT={th['ndt']:.3f} "
-                    f"ERV={th['erv']:.3f} HEP={th['hep']:.3f} bar | "
-                    f"Proc.{th['procedure']}",
-                )
-        except ValueError as ve:
-            _append_event_log("err", f"Seuils : {ve}")
-
-    status = _classify_pressure_status(pressure)
-    level  = "ok" if status == "nominal" else ("wrn" if status == "warning" else "err")
-    _append_event_log(level,
-        f"{pressure:.3f} bar | lat {latency_ms:.1f} ms | {status.upper()}")
-
-    if not math.isnan(sr["k_last"]):
-        _append_event_log(
-            "ok",
-            f"%K={sr['k_last']:.1f} %D={sr['d_last']:.1f} | "
-            f"σ={sr['turbulence_last']:.4f} | drift={sr['drift']['drift_direction']}",
-        )
-
-    return th
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §9  COMPOSANTS UI STATIQUES  (rendus hors fragment — chargement unique)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _render_static_header() -> None:
+        token = st.secrets["api_xa_uusd"]["api_key"]
+        # Configuration du capteur réel (XAUUSD)
+        query = json.dumps({"data":{"code":"XAUUSD","kline_type":1,"kline_timestamp_end":0,"query_kline_num":1}})
+        url = f"https://quote.alltick.co/quote-b-api/kline?token={token}&query={query}"
+        
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        if data.get("ret") == 200:
+            # Extraction de la pression absolue (Prix de clôture)
+            pressure = float(data["data"]["kline_list"]["kline_data"]["close_price"])
+            return pressure
+        else:
+            return None
+    except Exception as e:
+        st.error(f"Erreur de capteur : {e}")
+        return Nonedef _render_static_header() -> None:
     """Bandeau titre statique — rendu une seule fois au chargement de la page."""
     c_logo, c_title, c_badge = st.columns([0.07, 0.63, 0.30])
 
