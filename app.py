@@ -1,1876 +1,2691 @@
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-#  SYSTÈME DE CONTRÔLE HYDRODYNAMIQUE — CANALISATION XA-UUSD
-#  Version FINALE DE DÉPLOIEMENT — v4.0.0
-#  ─────────────────────────────────────────────────────────────────────────────
-#  Étape 1 : Ingestion API asynchrone + DataFrame historique
-#  Étape 2 : Moteur stochastique intégral (Kolmogorov / GBM)
-#  Étape 3 : Seuils d'intervention vitaux + Inhibition d'urgence
-#  Étape 4 : Interface temps réel fragmentée (@st.fragment — 5 s)
-#  ─────────────────────────────────────────────────────────────────────────────
-#  Auteur  : Ingénieur Senior — Architecture Fluides / RT-SW
-#  Usage   : streamlit run xa_uusd_dashboard.py
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║      XAU-QUANTUM-DASHBOARD  —  Kinetic Fluid Telemetry  v4.0  FINAL       ║
+║      Stochastic XAUUSD Pressure Monitor  |  AllTick API                   ║
+║      GBM Drift/Vol  ·  OU Relaxation  ·  Action Coordinates  ·  Resilient ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
-import math
-import datetime
-import asyncio
-import time
-from typing import Optional, Tuple
+DEPLOYMENT CHECKLIST
+────────────────────
+1.  pip install -r requirements.txt
+2.  mkdir -p .streamlit
+3.  Create .streamlit/secrets.toml  →  [api_xa_uusd]  api_key = "YOUR_TOKEN"
+4.  streamlit run app.py
 
-import numpy as np
-import pandas as pd
-import requests
+ARCHITECTURE (Blocs 1-2-3-4 fusionnés)
+────────────────────────────────────────
+Bloc 1 · CSS Quant-Dark  ·  API AllTick  ·  OHLCV pipeline
+Bloc 2 · GBM (μ,σ,σ_rolling)  ·  OU (θ,μ_eq,T½)  ·  Turbulence (Δ²P)
+Bloc 3 · ActionCoordinates (ENTRY/NDT/ERV/HEP)  ·  Safety Inhibitor
+Bloc 4 · try/except resilience shell  ·  "RE-CONNEXION AU CAPTEUR" UX
+"""
+
 import streamlit as st
+import requests
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import time
+from datetime import datetime, timezone
+import json
+from dataclasses import dataclass, field
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  §1  CONSTANTES — PIPELINE XA-UUSD
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG — must be the very first Streamlit call
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="XAU-QUANTUM-DASHBOARD",
+    page_icon="⚛",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-API_BASE_URL: str          = "https://api.fluiddynamics.net/v1/pressure"
-SENSOR_ID: str             = "XA-UUSD"
-API_TIMEOUT_SECONDS: int   = 8
-POLL_INTERVAL_SECONDS: int = 2          # Monitoring continu (bouton)
-FRAGMENT_INTERVAL: str     = "5s"       # @st.fragment auto-refresh
-MAX_HISTORY_ROWS: int      = 500
-PRESSURE_UNIT: str         = "bar"
-
-# Seuils de sécurité physiques XA-UUSD
-PRESSURE_NOMINAL_MIN: float  = 12.0
-PRESSURE_NOMINAL_MAX: float  = 48.0
-PRESSURE_WARNING_LOW: float  = 8.0
-PRESSURE_WARNING_HIGH: float = 55.0
-PRESSURE_CRITICAL_LOW: float = 4.0
-PRESSURE_CRITICAL_HIGH: float= 65.0
-
-# Paramètres moteur stochastique (Étape 2)
-TURBULENCE_WINDOW: int         = 14
-STOCH_K_WINDOW: int            = 14
-STOCH_D_SMOOTH: int            = 3
-DRIFT_POLYFIT_DEGREE: int      = 1
-MIN_ROWS_FOR_STOCHASTICS: int  = 5
-STOCH_OVERBOUGHT: float        = 80.0
-STOCH_OVERSOLD: float          = 20.0
-
-# Paramètres moteur d'intervention (Étape 3)
-TURBULENCE_INHIBIT_SIGMA_BASE: float  = 0.85
-TURBULENCE_INHIBIT_MULTIPLIER: float  = 3.0
-TURBULENCE_INHIBIT_THRESHOLD: float   = (
-    TURBULENCE_INHIBIT_SIGMA_BASE * TURBULENCE_INHIBIT_MULTIPLIER
-)  # = 2.55 bar
-NDT_VOLATILITY_RATIO: float    = 0.618   # Fibonacci — buffer dynamique
-ERV_SAFETY_MULTIPLIER: float   = 1.5     # 1.5 × σ_turb
-ERV_HARD_FLOOR: float          = PRESSURE_CRITICAL_LOW  + 1.0   # 5.0 bar
-ERV_HARD_CEILING: float        = PRESSURE_CRITICAL_HIGH - 1.0   # 64.0 bar
-HEP_FRICTION_OFFSET_BAR: float = 0.25   # Friction machinerie lourde
-ZEROING_MIN_KD_CROSSOVER: float= 0.5
-
-_INHIBIT_STATE_KEY: str = "PAUSE_DE_SECURITE"
-_INHIBIT_STATE_MSG: str = "PAUSE DE SÉCURITÉ — SYSTÈME EN SURPRESSION CHAOTIQUE"
-
-# Palette industrielle XA-UUSD
-COLOR_NOMINAL    = "#00E5A0"
-COLOR_WARNING    = "#FFB830"
-COLOR_CRITICAL   = "#FF3A3A"
-COLOR_BACKGROUND = "#0B0E1A"
-COLOR_PANEL      = "#111827"
-COLOR_BORDER     = "#1E2A40"
-COLOR_TEXT_PRI   = "#E8F0FE"
-COLOR_TEXT_MUT   = "#6B7FA3"
-COLOR_ACCENT     = "#3A7BFF"
-COLOR_STOCH_K    = "#A78BFA"
-COLOR_STOCH_D    = "#F472B6"
-COLOR_DRIFT      = "#FCD34D"
-COLOR_TURBULENCE = "#60A5FA"
-COLOR_INHIBIT    = "#FF0055"
-COLOR_ZP         = "#FB923C"
-COLOR_NDT        = "#34D399"
-COLOR_ERV        = "#F87171"
-COLOR_HEP        = "#818CF8"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §2  CSS — STYLE INDUSTRIEL HAUTE-DENSITÉ v4
-# ──────────────────────────────────────────────────────────────────────────────
-
-DASHBOARD_CSS: str = f"""
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CSS  —  Deep dark terminal aesthetic
+# ─────────────────────────────────────────────────────────────────────────────
+QUANTUM_CSS = """
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600;700&family=Barlow+Condensed:wght@400;700;900&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap');
 
-  html, body, [data-testid="stAppViewContainer"] {{
-      background-color: {COLOR_BACKGROUND} !important;
-      color: {COLOR_TEXT_PRI} !important;
-      font-family: 'Barlow', sans-serif;
-  }}
-  [data-testid="stSidebar"] {{
-      background-color: #0D1120 !important;
-      border-right: 1px solid {COLOR_BORDER};
-  }}
-  #MainMenu, footer, header {{ visibility: hidden; }}
+  :root {
+    --green:        #00FF41;
+    --green-dim:    #00CC33;
+    --green-faint:  #003B0D;
+    --amber:        #FFB300;
+    --red:          #FF3C3C;
+    --cyan:         #00E5FF;
+    --purple:       #BF5FFF;
+    --bg-void:      #000000;
+    --bg-panel:     #050F05;
+    --bg-card:      #080F08;
+    --border:       #00FF4140;
+    --border-glow:  #00FF4190;
+    --text-mono:    'Share Tech Mono', monospace;
+    --text-display: 'Orbitron', monospace;
+  }
 
-  /* ── Typographie ── */
-  .xa-title {{
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 2.1rem; font-weight: 900; letter-spacing: 0.12em;
-      text-transform: uppercase; color: {COLOR_TEXT_PRI}; line-height: 1.1;
-  }}
-  .xa-title span.accent {{ color: {COLOR_ACCENT}; }}
-  .xa-subtitle {{
-      font-family: 'Share Tech Mono', monospace; font-size: 0.72rem;
-      color: {COLOR_TEXT_MUT}; letter-spacing: 0.2em;
-      text-transform: uppercase; margin-top: 4px;
-  }}
-  .section-header {{
-      font-family: 'Barlow Condensed', sans-serif; font-size: 1.05rem;
-      font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase;
-      color: {COLOR_TEXT_MUT}; border-left: 3px solid {COLOR_ACCENT};
-      padding-left: 10px; margin: 14px 0 10px 0;
-  }}
-  .section-header.danger {{
-      border-left-color: {COLOR_INHIBIT}; color: {COLOR_INHIBIT};
-  }}
-  .section-header.live {{
-      border-left-color: {COLOR_NOMINAL}; color: {COLOR_NOMINAL};
-  }}
+  html, body, [class*="css"] {
+    font-family: var(--text-mono) !important;
+    background-color: var(--bg-void) !important;
+    color: var(--green) !important;
+  }
 
-  /* ── Cartes métriques ── */
-  .metric-card {{
-      background: {COLOR_PANEL}; border: 1px solid {COLOR_BORDER};
-      border-radius: 6px; padding: 16px 20px;
-      position: relative; overflow: hidden;
-  }}
-  .metric-card::before {{
-      content: ""; position: absolute; top: 0; left: 0;
-      width: 3px; height: 100%; background: {COLOR_ACCENT};
-  }}
-  .metric-card.warning::before  {{ background: {COLOR_WARNING}; }}
-  .metric-card.critical::before {{ background: {COLOR_CRITICAL}; }}
-  .metric-card.nominal::before  {{ background: {COLOR_NOMINAL}; }}
-  .metric-card.stoch::before    {{ background: {COLOR_STOCH_K}; }}
-  .metric-card.drift::before    {{ background: {COLOR_DRIFT}; }}
-  .metric-card.turb::before     {{ background: {COLOR_TURBULENCE}; }}
-  .metric-card.zp::before       {{ background: {COLOR_ZP}; }}
-  .metric-card.ndt::before      {{ background: {COLOR_NDT}; }}
-  .metric-card.erv::before      {{ background: {COLOR_ERV}; }}
-  .metric-card.hep::before      {{ background: {COLOR_HEP}; }}
-  .metric-label {{
-      font-family: 'Share Tech Mono', monospace; font-size: 0.65rem;
-      color: {COLOR_TEXT_MUT}; letter-spacing: 0.25em;
-      text-transform: uppercase; margin-bottom: 6px;
-  }}
-  .metric-value {{
-      font-family: 'Barlow Condensed', sans-serif; font-size: 2.6rem;
-      font-weight: 700; color: {COLOR_TEXT_PRI}; line-height: 1;
-  }}
-  .metric-unit {{
-      font-family: 'Share Tech Mono', monospace; font-size: 0.8rem;
-      color: {COLOR_TEXT_MUT}; margin-left: 6px;
-  }}
-  .metric-sub {{
-      font-family: 'Share Tech Mono', monospace; font-size: 0.65rem;
-      color: {COLOR_TEXT_MUT}; margin-top: 4px;
-  }}
+  .stApp {
+    background-color: var(--bg-void) !important;
+    background-image: repeating-linear-gradient(
+      0deg, transparent, transparent 2px,
+      rgba(0,255,65,0.015) 2px, rgba(0,255,65,0.015) 4px
+    );
+  }
 
-  /* ── Panneau ACTION / PAUSE (Étape 4) ── */
-  .action-panel {{
-      border-radius: 6px; padding: 18px 24px;
-      position: relative; overflow: hidden;
-      display: flex; flex-direction: column; gap: 6px;
-  }}
-  .action-panel.required {{
-      background: rgba(251,146,60,0.10);
-      border: 2px solid {COLOR_ZP};
-  }}
-  .action-panel.hold {{
-      background: rgba(58,123,255,0.07);
-      border: 2px solid {COLOR_ACCENT};
-  }}
-  .action-panel.inhibit {{
-      background: rgba(255,0,85,0.12);
-      border: 2px solid {COLOR_INHIBIT};
-      animation: pulse-inh 1.2s ease-in-out infinite;
-  }}
-  @keyframes pulse-inh {{
-      0%   {{ box-shadow: 0 0 0 0   rgba(255,0,85,0.45); }}
-      70%  {{ box-shadow: 0 0 0 12px rgba(255,0,85,0); }}
-      100% {{ box-shadow: 0 0 0 0   rgba(255,0,85,0); }}
-  }}
-  .action-headline {{
-      font-family: 'Barlow Condensed', sans-serif; font-size: 1.45rem;
-      font-weight: 900; letter-spacing: 0.15em; text-transform: uppercase;
-  }}
-  .action-headline.required {{ color: {COLOR_ZP}; }}
-  .action-headline.hold     {{ color: {COLOR_ACCENT}; }}
-  .action-headline.inhibit  {{ color: {COLOR_INHIBIT}; }}
-  .action-detail {{
-      font-family: 'Share Tech Mono', monospace; font-size: 0.72rem;
-      color: {COLOR_TEXT_MUT}; line-height: 1.6;
-  }}
-  .action-proc-badge {{
-      display: inline-block; padding: 4px 14px; border-radius: 2px;
-      font-family: 'Share Tech Mono', monospace; font-size: 0.78rem;
-      font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
-      margin-top: 4px;
-  }}
-  .proc-in   {{ background:rgba(0,229,160,0.14); color:{COLOR_NOMINAL};
-                border:1px solid rgba(0,229,160,0.35); }}
-  .proc-out  {{ background:rgba(255,58,58,0.14);  color:{COLOR_CRITICAL};
-                border:1px solid rgba(255,58,58,0.35); }}
-  .proc-hold {{ background:rgba(58,123,255,0.12); color:{COLOR_ACCENT};
-                border:1px solid rgba(58,123,255,0.3); }}
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg-void); }
+  ::-webkit-scrollbar-thumb { background: var(--green-dim); border-radius: 3px; }
 
-  /* ── Fragment ticker (Étape 4) ── */
-  .fragment-tick {{
-      font-family: 'Share Tech Mono', monospace; font-size: 0.62rem;
-      color: {COLOR_TEXT_MUT}; letter-spacing: 0.1em;
-      display: flex; align-items: center; gap: 6px;
-  }}
-  .tick-dot {{
-      width: 6px; height: 6px; border-radius: 50%;
-      background: {COLOR_NOMINAL}; display: inline-block;
-      animation: blink-dot 1s step-start infinite;
-  }}
-  @keyframes blink-dot {{ 50% {{ opacity: 0; }} }}
+  section[data-testid="stSidebar"] {
+    background-color: var(--bg-panel) !important;
+    border-right: 1px solid var(--border) !important;
+  }
 
-  /* ── Status badges ── */
-  .status-badge {{
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 4px 12px; border-radius: 2px;
-      font-family: 'Share Tech Mono', monospace; font-size: 0.7rem;
-      letter-spacing: 0.15em; font-weight: 700; text-transform: uppercase;
-  }}
-  .status-nominal  {{ background:rgba(0,229,160,0.12); color:{COLOR_NOMINAL};
-                      border:1px solid rgba(0,229,160,0.3); }}
-  .status-warning  {{ background:rgba(255,184,48,0.12); color:{COLOR_WARNING};
-                      border:1px solid rgba(255,184,48,0.3); }}
-  .status-critical {{ background:rgba(255,58,58,0.12);  color:{COLOR_CRITICAL};
-                      border:1px solid rgba(255,58,58,0.3); }}
-  .status-inhibit  {{ background:rgba(255,0,85,0.18);   color:{COLOR_INHIBIT};
-                      border:1px solid rgba(255,0,85,0.5);
-                      animation: pulse-inh 1.2s ease-in-out infinite; }}
+  h1, h2, h3, h4 {
+    font-family: var(--text-display) !important;
+    color: var(--green) !important;
+    text-shadow: 0 0 12px rgba(0,255,65,0.7), 0 0 24px rgba(0,255,65,0.3);
+    letter-spacing: 0.12em;
+  }
 
-  /* ── Divers ── */
-  .xa-divider {{ border:none; border-top:1px solid {COLOR_BORDER}; margin:18px 0; }}
-  .timestamp-chip {{
-      font-family:'Share Tech Mono',monospace; font-size:0.68rem;
-      color:{COLOR_TEXT_MUT}; letter-spacing:0.1em;
-  }}
-  .log-entry {{
-      font-family:'Share Tech Mono',monospace; font-size:0.72rem;
-      padding:4px 0; border-bottom:1px solid {COLOR_BORDER}; color:{COLOR_TEXT_MUT};
-  }}
-  .log-entry.err {{ color:{COLOR_CRITICAL}; }}
-  .log-entry.wrn {{ color:{COLOR_WARNING}; }}
-  .log-entry.ok  {{ color:{COLOR_NOMINAL}; }}
-  .log-entry.inh {{ color:{COLOR_INHIBIT}; font-weight:bold; }}
-  .stoch-regime {{
-      font-family:'Share Tech Mono',monospace; font-size:0.68rem;
-      letter-spacing:0.12em; padding:3px 10px; border-radius:2px;
-  }}
-  .regime-overbought {{ background:rgba(255,58,58,0.15);  color:{COLOR_CRITICAL};
-                        border:1px solid rgba(255,58,58,0.3); }}
-  .regime-oversold   {{ background:rgba(0,229,160,0.10);  color:{COLOR_NOMINAL};
-                        border:1px solid rgba(0,229,160,0.2); }}
-  .regime-neutral    {{ background:rgba(107,127,163,0.1); color:{COLOR_TEXT_MUT};
-                        border:1px solid {COLOR_BORDER}; }}
-  .threshold-table {{
-      width:100%; border-collapse:collapse;
-      font-family:'Share Tech Mono',monospace; font-size:0.78rem;
-  }}
-  .threshold-table th {{
-      text-transform:uppercase; letter-spacing:0.18em; color:{COLOR_TEXT_MUT};
-      font-size:0.62rem; border-bottom:1px solid {COLOR_BORDER};
-      padding:6px 10px; text-align:left;
-  }}
-  .threshold-table td {{
-      padding:8px 10px; border-bottom:1px solid {COLOR_BORDER};
-      color:{COLOR_TEXT_PRI}; vertical-align:middle;
-  }}
-  .threshold-table tr:hover td {{ background:rgba(58,123,255,0.04); }}
-  .th-zp  {{ color:{COLOR_ZP};  font-weight:bold; }}
-  .th-ndt {{ color:{COLOR_NDT}; font-weight:bold; }}
-  .th-erv {{ color:{COLOR_ERV}; font-weight:bold; }}
-  .th-hep {{ color:{COLOR_HEP}; font-weight:bold; }}
+  [data-testid="metric-container"] {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 4px !important;
+    padding: 12px 16px !important;
+    box-shadow: 0 0 18px rgba(0,255,65,0.08), inset 0 0 30px rgba(0,255,65,0.02);
+    transition: box-shadow 0.3s ease;
+  }
+  [data-testid="metric-container"]:hover {
+    box-shadow: 0 0 28px rgba(0,255,65,0.22), inset 0 0 30px rgba(0,255,65,0.05);
+  }
+  [data-testid="stMetricLabel"] {
+    color: var(--green-dim) !important;
+    font-size: 0.7rem !important;
+    letter-spacing: 0.18em;
+  }
+  [data-testid="stMetricValue"] {
+    color: var(--green) !important;
+    font-size: 1.5rem !important;
+    text-shadow: 0 0 8px rgba(0,255,65,0.8);
+  }
+  [data-testid="stMetricDelta"] svg { display: none; }
 
-  div[data-testid="stButton"] > button {{
-      background:transparent; color:{COLOR_ACCENT};
-      border:1px solid {COLOR_ACCENT}; border-radius:3px;
-      font-family:'Share Tech Mono',monospace; font-size:0.75rem;
-      letter-spacing:0.15em; text-transform:uppercase;
-      padding:8px 20px; transition:all 0.2s;
-  }}
-  div[data-testid="stButton"] > button:hover {{
-      background:{COLOR_ACCENT}; color:#fff;
-  }}
+  [data-testid="stVerticalBlock"] > div:has([data-testid="stPlotlyChart"]) {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px;
+  }
 
-  /* Customisation st.metric natif */
-  [data-testid="stMetric"] {{
-      background: {COLOR_PANEL};
-      border: 1px solid {COLOR_BORDER};
-      border-radius: 6px;
-      padding: 14px 18px !important;
-  }}
-  [data-testid="stMetricLabel"] {{
-      font-family:'Share Tech Mono',monospace !important;
-      font-size:0.65rem !important; letter-spacing:0.2em !important;
-      text-transform:uppercase !important; color:{COLOR_TEXT_MUT} !important;
-  }}
-  [data-testid="stMetricValue"] {{
-      font-family:'Barlow Condensed',sans-serif !important;
-      font-size:2.0rem !important; font-weight:700 !important;
-      color:{COLOR_TEXT_PRI} !important;
-  }}
-  [data-testid="stMetricDelta"] {{
-      font-family:'Share Tech Mono',monospace !important;
-      font-size:0.75rem !important;
-  }}
+  hr { border-color: var(--border-glow) !important; box-shadow: 0 0 6px rgba(0,255,65,0.3); }
+
+  .stButton > button {
+    background: var(--bg-card) !important;
+    color: var(--green) !important;
+    border: 1px solid var(--green-dim) !important;
+    font-family: var(--text-mono) !important;
+    letter-spacing: 0.1em;
+    border-radius: 2px !important;
+    transition: all 0.2s;
+  }
+  .stButton > button:hover {
+    background: var(--green-faint) !important;
+    box-shadow: 0 0 14px rgba(0,255,65,0.5);
+  }
+
+  .stSelectbox > div > div,
+  .stTextInput > div > div > input {
+    background: var(--bg-card) !important;
+    color: var(--green) !important;
+    border: 1px solid var(--border) !important;
+    font-family: var(--text-mono) !important;
+  }
+
+  .stAlert {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--green) !important;
+  }
+
+  .stTabs [data-baseweb="tab-list"] {
+    background: var(--bg-void) !important;
+    border-bottom: 1px solid var(--border) !important;
+  }
+  .stTabs [data-baseweb="tab"] {
+    font-family: var(--text-mono) !important;
+    color: var(--green-dim) !important;
+    letter-spacing: 0.1em;
+    font-size: 0.76rem;
+  }
+  .stTabs [aria-selected="true"] {
+    color: var(--green) !important;
+    border-bottom: 2px solid var(--green) !important;
+    text-shadow: 0 0 8px rgba(0,255,65,0.8);
+  }
+
+  .quantum-badge {
+    display: inline-block;
+    background: var(--green-faint);
+    border: 1px solid var(--green);
+    color: var(--green);
+    font-family: var(--text-mono);
+    font-size: 0.68rem;
+    padding: 2px 10px;
+    border-radius: 2px;
+    letter-spacing: 0.15em;
+    text-shadow: 0 0 6px rgba(0,255,65,0.9);
+    animation: pulse-badge 1.8s infinite;
+  }
+  @keyframes pulse-badge {
+    0%, 100% { box-shadow: 0 0 4px rgba(0,255,65,0.4); }
+    50%       { box-shadow: 0 0 14px rgba(0,255,65,0.9); }
+  }
+
+  .turb-badge {
+    display: inline-block;
+    background: rgba(255,60,60,0.12);
+    border: 1px solid #FF3C3C;
+    color: #FF3C3C;
+    font-family: var(--text-mono);
+    font-size: 0.7rem;
+    padding: 3px 10px;
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+    animation: pulse-red 0.6s infinite;
+  }
+  @keyframes pulse-red {
+    0%, 100% { box-shadow: 0 0 4px rgba(255,60,60,0.4); }
+    50%       { box-shadow: 0 0 16px rgba(255,60,60,0.9); }
+  }
+
+  .regime-compress {
+    display: inline-block;
+    background: rgba(255,60,60,0.1);
+    border: 1px solid #FF3C3C;
+    color: #FF3C3C;
+    font-family: var(--text-mono);
+    font-size: 0.72rem;
+    padding: 3px 12px;
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+  }
+  .regime-relax {
+    display: inline-block;
+    background: rgba(0,255,65,0.08);
+    border: 1px solid #00FF41;
+    color: #00FF41;
+    font-family: var(--text-mono);
+    font-size: 0.72rem;
+    padding: 3px 12px;
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+  }
+  .regime-neutral {
+    display: inline-block;
+    background: rgba(255,179,0,0.08);
+    border: 1px solid #FFB300;
+    color: #FFB300;
+    font-family: var(--text-mono);
+    font-size: 0.72rem;
+    padding: 3px 12px;
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+  }
+
+  .q-analytics-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 14px 16px;
+    margin: 6px 0;
+    box-shadow: 0 0 14px rgba(0,255,65,0.04);
+  }
+  .q-analytics-title {
+    font-family: var(--text-display);
+    font-size: 0.66rem;
+    color: var(--green-dim);
+    letter-spacing: 0.22em;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 5px;
+  }
+  .q-eq {
+    font-family: var(--text-mono);
+    font-size: 0.70rem;
+    color: var(--cyan);
+    background: rgba(0,229,255,0.05);
+    border-left: 2px solid var(--cyan);
+    padding: 4px 10px;
+    margin: 6px 0;
+    letter-spacing: 0.04em;
+  }
+
+  .quantum-title {
+    font-family: var(--text-display) !important;
+    font-size: 2.0rem;
+    font-weight: 900;
+    color: var(--green);
+    text-shadow: 0 0 20px rgba(0,255,65,0.8), 0 0 60px rgba(0,255,65,0.2);
+    letter-spacing: 0.2em;
+    line-height: 1.1;
+  }
+  .quantum-subtitle {
+    font-family: var(--text-mono);
+    font-size: 0.72rem;
+    color: var(--green-dim);
+    letter-spacing: 0.28em;
+    margin-top: 4px;
+  }
+
+  .data-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(0,255,65,0.08);
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+  }
+  .data-label { color: var(--green-dim); }
+  .data-value { color: var(--green); text-shadow: 0 0 4px rgba(0,255,65,0.5); }
+
+  .blink { animation: blink-anim 0.9s step-end infinite; }
+  @keyframes blink-anim { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+  .q-divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--green), transparent);
+    margin: 12px 0;
+    box-shadow: 0 0 8px rgba(0,255,65,0.4);
+  }
+  .q-divider-cyan {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+    margin: 10px 0;
+    box-shadow: 0 0 6px rgba(0,229,255,0.3);
+  }
+
+  /* ── Action Coordinates Panel ── */
+  .ac-panel {
+    background: linear-gradient(135deg, #000000 0%, #050A0A 100%);
+    border: 1px solid rgba(0,229,255,0.35);
+    border-radius: 4px;
+    padding: 16px 18px;
+    margin: 8px 0;
+    box-shadow: 0 0 22px rgba(0,229,255,0.08), inset 0 0 40px rgba(0,229,255,0.02);
+    position: relative;
+    overflow: hidden;
+  }
+  .ac-panel::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, #00E5FF, transparent);
+    box-shadow: 0 0 10px rgba(0,229,255,0.6);
+  }
+  .ac-title {
+    font-family: var(--text-display);
+    font-size: 0.65rem;
+    color: #00E5FF;
+    letter-spacing: 0.3em;
+    margin-bottom: 12px;
+    text-shadow: 0 0 8px rgba(0,229,255,0.7);
+  }
+
+  /* ── Individual coordinate card ── */
+  .coord-card {
+    background: rgba(0,0,0,0.6);
+    border-radius: 3px;
+    padding: 10px 14px;
+    margin: 5px 0;
+    border-left: 3px solid transparent;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+  .coord-card.entry  { border-left-color: #00FF41; }
+  .coord-card.ndt    { border-left-color: #00E5FF; }
+  .coord-card.erv    { border-left-color: #FF3C3C; }
+  .coord-card.hep    { border-left-color: #FFB300; }
+  .coord-card:hover  { box-shadow: 0 0 12px rgba(0,229,255,0.18); }
+
+  .coord-label {
+    font-family: var(--text-display);
+    font-size: 0.58rem;
+    letter-spacing: 0.25em;
+    margin-bottom: 3px;
+  }
+  .coord-label.entry { color: #00FF41; }
+  .coord-label.ndt   { color: #00E5FF; }
+  .coord-label.erv   { color: #FF3C3C; }
+  .coord-label.hep   { color: #FFB300; }
+
+  .coord-value {
+    font-family: var(--text-mono);
+    font-size: 1.35rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-shadow: 0 0 10px currentColor;
+  }
+  .coord-value.entry { color: #00FF41; }
+  .coord-value.ndt   { color: #00E5FF; }
+  .coord-value.erv   { color: #FF3C3C; }
+  .coord-value.hep   { color: #FFB300; }
+
+  .coord-sub {
+    font-family: var(--text-mono);
+    font-size: 0.65rem;
+    margin-top: 2px;
+    opacity: 0.7;
+  }
+
+  /* ── Inhibition / PAUSE state ── */
+  .inhibit-overlay {
+    background: rgba(255,60,60,0.06);
+    border: 1px solid rgba(255,60,60,0.6);
+    border-radius: 4px;
+    padding: 18px 20px;
+    text-align: center;
+    animation: pulse-inhibit 1.2s ease-in-out infinite;
+    margin: 8px 0;
+  }
+  @keyframes pulse-inhibit {
+    0%, 100% { box-shadow: 0 0 8px rgba(255,60,60,0.3); }
+    50%       { box-shadow: 0 0 28px rgba(255,60,60,0.8); }
+  }
+  .inhibit-title {
+    font-family: var(--text-display);
+    font-size: 0.85rem;
+    color: #FF3C3C;
+    letter-spacing: 0.2em;
+    text-shadow: 0 0 14px rgba(255,60,60,0.9);
+    margin-bottom: 8px;
+  }
+  .inhibit-sub {
+    font-family: var(--text-mono);
+    font-size: 0.7rem;
+    color: rgba(255,60,60,0.75);
+    letter-spacing: 0.1em;
+  }
+  .inhibit-zero {
+    font-family: var(--text-mono);
+    font-size: 1.1rem;
+    color: rgba(255,60,60,0.4);
+    letter-spacing: 0.3em;
+    margin-top: 6px;
+  }
+
+  /* ── Signal badge ── */
+  .signal-long {
+    display: inline-block;
+    background: rgba(0,255,65,0.12);
+    border: 1px solid #00FF41;
+    color: #00FF41;
+    font-family: var(--text-mono);
+    font-size: 0.75rem;
+    padding: 4px 14px;
+    border-radius: 2px;
+    letter-spacing: 0.15em;
+    text-shadow: 0 0 8px rgba(0,255,65,0.9);
+    animation: pulse-badge 1.8s infinite;
+  }
+  .signal-short {
+    display: inline-block;
+    background: rgba(255,60,60,0.12);
+    border: 1px solid #FF3C3C;
+    color: #FF3C3C;
+    font-family: var(--text-mono);
+    font-size: 0.75rem;
+    padding: 4px 14px;
+    border-radius: 2px;
+    letter-spacing: 0.15em;
+    text-shadow: 0 0 8px rgba(255,60,60,0.9);
+    animation: pulse-red 0.9s infinite;
+  }
+  .signal-wait {
+    display: inline-block;
+    background: rgba(255,179,0,0.08);
+    border: 1px solid #FFB300;
+    color: #FFB300;
+    font-family: var(--text-mono);
+    font-size: 0.75rem;
+    padding: 4px 14px;
+    border-radius: 2px;
+    letter-spacing: 0.15em;
+  }
+
+  /* ── Stochastic oscillator bar ── */
+  .stoch-bar-outer {
+    background: rgba(0,229,255,0.06);
+    border: 1px solid rgba(0,229,255,0.2);
+    border-radius: 2px;
+    height: 8px;
+    margin: 6px 0;
+    overflow: hidden;
+  }
+  .stoch-bar-inner {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.4s ease;
+  }
+
+  /* ── Resilience / Reconnection overlay ── */
+  .reconnect-panel {
+    background: rgba(0,229,255,0.04);
+    border: 1px solid rgba(0,229,255,0.25);
+    border-radius: 4px;
+    padding: 18px 24px;
+    text-align: center;
+    margin: 12px 0;
+    animation: pulse-reconnect 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse-reconnect {
+    0%, 100% { box-shadow: 0 0 6px rgba(0,229,255,0.15); }
+    50%       { box-shadow: 0 0 22px rgba(0,229,255,0.5); }
+  }
+  .reconnect-title {
+    font-family: var(--text-display);
+    font-size: 0.82rem;
+    color: #00E5FF;
+    letter-spacing: 0.25em;
+    text-shadow: 0 0 10px rgba(0,229,255,0.8);
+    margin-bottom: 6px;
+  }
+  .reconnect-sub {
+    font-family: var(--text-mono);
+    font-size: 0.68rem;
+    color: rgba(0,229,255,0.6);
+    letter-spacing: 0.12em;
+  }
+  .reconnect-dots span {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #00E5FF;
+    margin: 0 3px;
+    animation: dot-blink 1.4s step-start infinite;
+  }
+  .reconnect-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .reconnect-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes dot-blink {
+    0%, 80%, 100% { opacity: 0.15; }
+    40%           { opacity: 1; }
+  }
+
+  /* ── Step error inline badge ── */
+  .step-error {
+    display: inline-block;
+    background: rgba(255,179,0,0.07);
+    border: 1px solid rgba(255,179,0,0.3);
+    border-radius: 3px;
+    padding: 3px 10px;
+    font-family: var(--text-mono);
+    font-size: 0.66rem;
+    color: #FFB300;
+    letter-spacing: 0.1em;
+    margin: 3px 0;
+  }
+
+  #MainMenu, footer, header { visibility: hidden; }
+  .block-container { padding-top: 1.2rem !important; padding-bottom: 0.5rem !important; }
 </style>
 """
 
+st.markdown(QUANTUM_CSS, unsafe_allow_html=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  §3  SESSION STATE
-# ──────────────────────────────────────────────────────────────────────────────
 
-def initialize_session_state() -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+ALLTICK_BASE_URL      = "https://quote.tradeswitcher.com"
+ALLTICK_KLINE_PATH    = "/quote-b-api/kline"
+SYMBOL                = "XAUUSD.a"
+INTERVAL_1M           = "1"
+INTERVAL_5M           = "5"
+CANDLE_FETCH_COUNT    = 120
+REFRESH_SECONDS       = 2
+
+# Analytical engine parameters
+GBM_WINDOW            = 14      # rolling window in cycles for instantaneous variance
+OU_MIN_SAMPLES        = 10      # minimum candles required to fit OU model
+TURB_ACCEL_STD_THRESH = 2.5     # sigma threshold — second derivative anomaly filter
+
+# Action coordinate engine constants
+STOCH_K_PERIOD        = 14      # %K lookback period
+STOCH_D_PERIOD        = 3       # %D smoothing period
+STOCH_EXHAUSTION_ZONE = 20.0    # energy exhaustion threshold for entry signal
+STOCH_OVERBOUGHT_ZONE = 80.0    # overbought threshold for short signal
+NDT_SIGMA_MULTIPLE    = 2.5     # Take Profit = entry + 2.5 × σ_GBM × price
+ERV_SIGMA_MULTIPLE    = 1.5     # Stop Loss   = entry − 1.5 × σ_GBM × price
+HEP_FRICTION_OFFSET   = 0.002   # Break Even  = entry × (1 + 0.2%)  mechanical friction
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESILIENCE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reconnect_ui(reason: str = "", retry: int = 0) -> None:
     """
-    Initialise toutes les clés de session Streamlit au premier chargement.
-    Garantit la cohérence de l'état entre les cycles @st.fragment et les
-    reruns complets de la page.
+    Display the 'RE-CONNEXION AU CAPTEUR' overlay instead of a crash/red error.
+    Called whenever a pipeline step raises an unrecoverable exception.
+
+    Parameters
+    ──────────
+    reason : str  — short human-readable cause (shown in sub-text)
+    retry  : int  — current tick count (shown as retry counter)
     """
-    defaults: dict = {
-        "pressure_history_df":    _build_empty_pressure_dataframe(),
-        "total_api_calls":        0,
-        "failed_api_calls":       0,
-        "last_successful_ts":     None,
-        "monitoring_active":      False,
-        "event_log":              [],
-        "stoch_results":          None,
-        "intervention_thresholds":None,
-        "inhibit_count":          0,
-        "fragment_cycle":         0,      # Compteur de cycles @st.fragment
-        "last_fragment_error":    None,   # Dernière erreur catchée dans fragment
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §4  DATAFRAME PRESSION
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _build_empty_pressure_dataframe() -> pd.DataFrame:
-    """
-    Construit un DataFrame Pandas typé vide — schéma complet XA-UUSD.
-
-    Colonnes :
-        timestamp       datetime64[ns]  Horodatage UTC de la mesure
-        pressure_bar    float64         Pression absolue (bar)
-        sensor_id       object          Identifiant capteur
-        api_latency_ms  float64         Latence API (ms)
-        status          object          'nominal' | 'warning' | 'critical'
-        delta_bar       float64         Δ pression vs mesure N-1
-        rolling_avg_5   float64         Moyenne glissante 5 périodes
-        rolling_std_5   float64         Écart-type glissant 5 périodes
-    """
-    return pd.DataFrame({
-        "timestamp":      pd.Series(dtype="datetime64[ns]"),
-        "pressure_bar":   pd.Series(dtype="float64"),
-        "sensor_id":      pd.Series(dtype="object"),
-        "api_latency_ms": pd.Series(dtype="float64"),
-        "status":         pd.Series(dtype="object"),
-        "delta_bar":      pd.Series(dtype="float64"),
-        "rolling_avg_5":  pd.Series(dtype="float64"),
-        "rolling_std_5":  pd.Series(dtype="float64"),
-    })
-
-
-def _classify_pressure_status(pressure: float) -> str:
-    """Classifie la pression selon les seuils XA-UUSD.
-    Returns: 'critical' | 'warning' | 'nominal'."""
-    if pressure <= PRESSURE_CRITICAL_LOW or pressure >= PRESSURE_CRITICAL_HIGH:
-        return "critical"
-    if pressure <= PRESSURE_WARNING_LOW  or pressure >= PRESSURE_WARNING_HIGH:
-        return "warning"
-    return "nominal"
-
-
-def append_pressure_record(
-    df: pd.DataFrame,
-    pressure: float,
-    latency_ms: float,
-    ts: Optional[datetime.datetime] = None,
-) -> pd.DataFrame:
-    """
-    Ajoute une mesure au DataFrame historique, recalcule les colonnes
-    dérivées et applique la politique de rétention MAX_HISTORY_ROWS.
-    """
-    if ts is None:
-        ts = datetime.datetime.utcnow()
-
-    delta = (pressure - float(df["pressure_bar"].iloc[-1])) if len(df) > 0 else 0.0
-
-    new_df = pd.concat([
-        df,
-        pd.DataFrame([{
-            "timestamp":      ts,
-            "pressure_bar":   pressure,
-            "sensor_id":      SENSOR_ID,
-            "api_latency_ms": latency_ms,
-            "status":         _classify_pressure_status(pressure),
-            "delta_bar":      delta,
-            "rolling_avg_5":  float("nan"),
-            "rolling_std_5":  float("nan"),
-        }])
-    ], ignore_index=True)
-
-    new_df["rolling_avg_5"] = (
-        new_df["pressure_bar"].rolling(window=5, min_periods=1).mean()
-    )
-    new_df["rolling_std_5"] = (
-        new_df["pressure_bar"].rolling(window=5, min_periods=1).std().fillna(0.0)
-    )
-
-    if len(new_df) > MAX_HISTORY_ROWS:
-        new_df = new_df.iloc[-MAX_HISTORY_ROWS:].reset_index(drop=True)
-    return new_df
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §5  MOTEUR STOCHASTIQUE INTÉGRAL (Étape 2)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def calculate_turbulence_variance(df: pd.DataFrame) -> pd.Series:
-    """
-    Écart-type glissant des Δp sur TURBULENCE_WINDOW périodes.
-
-    Physique : σ_turb(t) ∝ √(énergie cinétique latente) — proxy de la
-    dissipation de Kolmogorov ε ∝ σ_turb³ / L_intégrale.
-
-    Vectorisé : np.diff O(n) → pandas.rolling(14).std() Cython.
-    Retourne NaN si df < 2 lignes.
-    """
-    if len(df) < 2:
-        return pd.Series(np.full(len(df), np.nan), index=df.index,
-                         name="turbulence_sigma")
-
-    delta_p = np.diff(df["pressure_bar"].values.astype(np.float64),
-                      prepend=df["pressure_bar"].values[0])
-    sigma = (pd.Series(delta_p, index=df.index)
-             .rolling(window=TURBULENCE_WINDOW, min_periods=2).std())
-    sigma.name = "turbulence_sigma"
-    return sigma
-
-
-def stochastic_pressure_oscillator(
-    df: pd.DataFrame,
-) -> Tuple[pd.Series, pd.Series]:
-    """
-    Oscillateur stochastique de Lane transposé aux fluctuations de pression.
-
-    %K(t) = 100 × [p(t) − P_min(t,N)] / [P_max(t,N) − P_min(t,N)]
-    %D(t) = SMA_M(%K(t))
-
-    Convention dénominateur nul → %K = 50.0 (régime constant neutre).
-    Retourne deux Series de NaN si df < MIN_ROWS_FOR_STOCHASTICS.
-    """
-    nan_s = pd.Series(np.full(len(df), np.nan), index=df.index, dtype=np.float64)
-    if len(df) < MIN_ROWS_FOR_STOCHASTICS:
-        return nan_s.rename("%K"), nan_s.rename("%D")
-
-    p = df["pressure_bar"].astype(np.float64)
-    rmin = p.rolling(STOCH_K_WINDOW, min_periods=1).min()
-    rmax = p.rolling(STOCH_K_WINDOW, min_periods=1).max()
-    rng  = (rmax - rmin).values
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        k_raw = np.where(rng == 0.0, 50.0, 100.0 * (p.values - rmin.values) / rng)
-
-    pct_k = pd.Series(np.clip(k_raw, 0.0, 100.0), index=df.index,
-                      name="%K", dtype=np.float64)
-    pct_d = pct_k.rolling(STOCH_D_SMOOTH, min_periods=1).mean()
-    pct_d.name = "%D"
-    return pct_k, pct_d
-
-
-def calculate_hydrodynamic_drift(df: pd.DataFrame) -> dict:
-    """
-    Drift directionnel GBM : dp = μ·p·dt + σ·p·dW_t.
-
-    Algorithme :
-        t_norm ∈ [0,1] → np.polyfit deg.1 → slope dénormalisé bar/période
-        μ_log  = mean(ln(p_t/p_{t-1}))
-        σ_real = std(log_returns) × √n
-        R²     = 1 − SS_res/SS_tot
-
-    Retourne dict avec sufficient_data=False si df < MIN_ROWS_FOR_STOCHASTICS.
-    """
-    default = {
-        "drift_bar_per_period": 0.0, "drift_direction": "stable",
-        "drift_magnitude": "faible", "regime": "nominal",
-        "mu_log": 0.0, "sigma_realised": 0.0,
-        "p_intercept": 0.0, "p_projected_next": 0.0,
-        "r_squared": 0.0, "n_samples": len(df), "sufficient_data": False,
-    }
-    if len(df) < MIN_ROWS_FOR_STOCHASTICS:
-        return default
-
-    p  = df["pressure_bar"].values.astype(np.float64)
-    n  = len(p)
-    tn = np.linspace(0.0, 1.0, n)
-    cf = np.polyfit(tn, p, deg=DRIFT_POLYFIT_DEGREE)
-    drift_bpp = float(cf[0]) / max(n - 1, 1)
-    p_proj    = float(np.polyval(cf, 1.0 + 1.0 / max(n - 1, 1)))
-
-    p_hat  = np.polyval(cf, tn)
-    ss_res = float(np.sum((p - p_hat) ** 2))
-    ss_tot = float(np.sum((p - np.mean(p)) ** 2))
-    r2     = float(np.clip(1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0, 0.0, 1.0))
-
-    pp = p[p > 0]
-    if len(pp) >= 2:
-        lr      = np.diff(np.log(pp))
-        mu_log  = float(np.mean(lr))
-        sig_r   = float(np.std(lr, ddof=1) * math.sqrt(n))
-    else:
-        mu_log, sig_r = 0.0, 0.0
-
-    STABLE_T = 0.01;  STRONG_T = 0.50
-    if abs(drift_bpp) < STABLE_T:
-        direction, magnitude = "stable", "faible"
-    elif drift_bpp > 0:
-        direction = "hausse"
-        magnitude = "fort" if abs(drift_bpp) >= STRONG_T else "modéré"
-    else:
-        direction = "baisse"
-        magnitude = "fort" if abs(drift_bpp) >= STRONG_T else "modéré"
-
-    last_p = float(p[-1])
-    if   direction == "hausse" and last_p > PRESSURE_NOMINAL_MAX: regime = "surpression_critique"
-    elif direction == "baisse" and last_p < PRESSURE_NOMINAL_MIN: regime = "dépressurisation_lente"
-    else:                                                           regime = "nominal"
-
-    return {
-        "drift_bar_per_period": drift_bpp, "drift_direction": direction,
-        "drift_magnitude": magnitude,      "regime": regime,
-        "mu_log": mu_log,                  "sigma_realised": sig_r,
-        "p_intercept": float(cf[1]),       "p_projected_next": p_proj,
-        "r_squared": r2,                   "n_samples": n,
-        "sufficient_data": True,
-    }
-
-
-def run_stochastic_engine(df: pd.DataFrame) -> dict:
-    """
-    Orchestre les trois fonctions stochastiques sur un snapshot unique de df.
-    Retourne un dict unifié avec les scalaires de la dernière mesure prêts à
-    l'affichage et la classification du régime stochastique.
-    """
-    turb   = calculate_turbulence_variance(df)
-    pk, pd_ = stochastic_pressure_oscillator(df)
-    drift  = calculate_hydrodynamic_drift(df)
-
-    def _last(s: pd.Series) -> float:
-        return float(s.iloc[-1]) if len(s) > 0 and not np.isnan(s.iloc[-1]) else float("nan")
-
-    k_last = _last(pk)
-    regime = ("overbought" if not math.isnan(k_last) and k_last >= STOCH_OVERBOUGHT
-              else "oversold" if not math.isnan(k_last) and k_last <= STOCH_OVERSOLD
-              else "neutral")
-
-    return {
-        "turbulence_series": turb,
-        "pct_k":             pk,
-        "pct_d":             pd_,
-        "drift":             drift,
-        "turbulence_last":   _last(turb),
-        "k_last":            k_last,
-        "d_last":            _last(pd_),
-        "stoch_regime":      regime,
-        "computed_at":       datetime.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3] + " UTC",
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §6  MOTEUR DES SEUILS D'INTERVENTION (Étape 3)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def calculate_intervention_thresholds(
-    current_pressure: float,
-    volatility:       float,
-    stoch_k:          float,
-    stoch_d:          float,
-    drift:            dict,
-) -> dict:
-    """
-    Synthétise la matrice vectorielle fluide en coordonnées d'intervention
-    absolues pour l'opérateur de garde sur le panneau de commande XA-UUSD.
-
-    Cascade de décision (priorité décroissante) :
-
-    [0] INHIBITION D'URGENCE ─────────────────────────────────────────────────
-        Condition : volatility > TURBULENCE_INHIBIT_THRESHOLD (2.55 bar)
-        → Court-circuite IMMÉDIATEMENT toute la cascade.
-        → Retourne tous les seuils à None.
-        → L'opérateur NE DOIT PAS agir sur les vannes.
-
-    [1] ZEROING POINT (ZP) ────────────────────────────────────────────────────
-        Point d'inversion cinétique. Trois axes de détection :
-        · Axe 1 : %K < 20 ET %K > %D  → exhaustion ascendante → Procédure IN
-          ZP = P_courante − (σ × 0.618)
-        · Axe 2 : %K > 80 ET %K < %D  → saturation descendante → Procédure OUT
-          ZP = P_courante + (σ × 0.618)
-        · Axe 3 (drift GBM)            → direction drift sans croisement franc
-        · Défaut HOLD                  → ZP = P_courante
-
-    [2] NDT (Nominal Decompression Threshold) ─────────────────────────────────
-        Jauge de désengagement nominal.
-        NDT = ZP ± (σ × 0.618)   [ratio Fibonacci — buffer dynamique]
-        Clipé dans [PRESSURE_WARNING_LOW, PRESSURE_WARNING_HIGH].
-
-    [3] ERV (Emergency Relief Valve) ──────────────────────────────────────────
-        Barrière rigide de coupure préventive.
-        ERV = P_courante ± (σ × 1.5)
-        Contraintes : [ERV_HARD_FLOOR=5.0 bar, ERV_HARD_CEILING=64.0 bar]
-
-    [4] HEP (Hydrostatique Equilibrium Point) ─────────────────────────────────
-        Point neutre cible post-intervention, compensant la friction mécanique.
-        HEP = ZP ± 0.25 bar
-        Clipé dans [PRESSURE_NOMINAL_MIN, PRESSURE_NOMINAL_MAX].
-
-    Args:
-        current_pressure : Pression absolue courante (bar) — doit être > 0.
-        volatility       : σ_turbulence courante (bar) — NaN traité comme 0.
-        stoch_k          : %K [0,100] — NaN traité comme 50 (neutre).
-        stoch_d          : %D [0,100] — NaN traité comme 50 (neutre).
-        drift            : dict issu de calculate_hydrodynamic_drift().
-
-    Returns:
-        dict — clés : operational_state, state_message, inhibited,
-                      inhibit_reason, zeroing_point, ndt, erv, hep,
-                      procedure, zeroing_direction, computed_at.
-
-    Raises:
-        ValueError : current_pressure ≤ 0 ou non-fini.
-    """
-    ts = datetime.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3] + " UTC"
-
-    if not math.isfinite(current_pressure) or current_pressure <= 0:
-        raise ValueError(
-            f"calculate_intervention_thresholds : current_pressure invalide "
-            f"({current_pressure})."
-        )
-
-    # Assainissement NaN
-    vol = volatility if (math.isfinite(volatility) and volatility >= 0) else 0.0
-    k   = stoch_k   if math.isfinite(stoch_k)   else 50.0
-    d   = stoch_d   if math.isfinite(stoch_d)   else 50.0
-
-    # ── [0] INHIBITION D'URGENCE ─────────────────────────────────────────
-    if vol > TURBULENCE_INHIBIT_THRESHOLD:
-        excess = (vol - TURBULENCE_INHIBIT_THRESHOLD) / TURBULENCE_INHIBIT_THRESHOLD * 100.0
-        return {
-            "operational_state": _INHIBIT_STATE_KEY,
-            "state_message":     _INHIBIT_STATE_MSG,
-            "inhibited":         True,
-            "inhibit_reason": (
-                f"σ_turb={vol:.4f} bar > seuil {TURBULENCE_INHIBIT_THRESHOLD:.2f} bar "
-                f"({TURBULENCE_INHIBIT_MULTIPLIER}×σ_base) de +{excess:.1f} % — "
-                f"Suspendre toute intervention sur les vannes."
-            ),
-            "zeroing_point":     None,
-            "ndt":               None,
-            "erv":               None,
-            "hep":               None,
-            "procedure":         None,
-            "zeroing_direction": None,
-            "computed_at":       ts,
-        }
-
-    # ── [1] ZEROING POINT ────────────────────────────────────────────────
-    kd   = k - d
-    cross_detected = abs(kd) >= ZEROING_MIN_KD_CROSSOVER
-    buf  = vol * NDT_VOLATILITY_RATIO
-
-    if k < ZEROING_STOCH_LOW_ZONE  if hasattr(k, '__float__') else False and cross_detected and kd > 0:
-        procedure, z_dir, zp_raw = "IN",   "hausse", current_pressure - buf
-    elif k > ZEROING_STOCH_HIGH_ZONE and cross_detected and kd < 0:
-        procedure, z_dir, zp_raw = "OUT",  "baisse", current_pressure + buf
-    elif drift["sufficient_data"] and drift["drift_direction"] == "hausse":
-        procedure, z_dir, zp_raw = "OUT",  "hausse", drift["p_projected_next"]
-    elif drift["sufficient_data"] and drift["drift_direction"] == "baisse":
-        procedure, z_dir, zp_raw = "IN",   "baisse", drift["p_projected_next"]
-    else:
-        procedure, z_dir, zp_raw = "HOLD", "neutre", current_pressure
-
-    # Re-évaluation explicite axe 1 (contournement condition composée)
-    if k < ZEROING_STOCH_LOW_ZONE and cross_detected and kd > 0 and procedure == "HOLD":
-        procedure, z_dir, zp_raw = "IN", "hausse", current_pressure - buf
-
-    zp = float(np.clip(zp_raw, PRESSURE_CRITICAL_LOW, PRESSURE_CRITICAL_HIGH))
-
-    # ── [2] NDT ──────────────────────────────────────────────────────────
-    ndt_raw = (zp + buf if procedure == "IN"
-               else zp - buf if procedure == "OUT"
-               else zp)
-    ndt = float(np.clip(ndt_raw, PRESSURE_WARNING_LOW, PRESSURE_WARNING_HIGH))
-
-    # ── [3] ERV ──────────────────────────────────────────────────────────
-    erv_off  = vol * ERV_SAFETY_MULTIPLIER
-    erv_high = float(min(current_pressure + erv_off, ERV_HARD_CEILING))
-    erv_low  = float(max(current_pressure - erv_off, ERV_HARD_FLOOR))
-    if   procedure == "IN":  erv = erv_low
-    elif procedure == "OUT": erv = erv_high
-    else:
-        erv = erv_high if abs(erv_high - PRESSURE_CRITICAL_HIGH) < abs(erv_low - PRESSURE_CRITICAL_LOW) else erv_low
-
-    # ── [4] HEP ──────────────────────────────────────────────────────────
-    hep_raw = (zp + HEP_FRICTION_OFFSET_BAR if procedure == "IN"
-               else zp - HEP_FRICTION_OFFSET_BAR if procedure == "OUT"
-               else zp)
-    hep = float(np.clip(hep_raw, PRESSURE_NOMINAL_MIN, PRESSURE_NOMINAL_MAX))
-
-    proc_txt = {
-        "IN":   "PROCÉDURE IN  — Injection fluide requise",
-        "OUT":  "PROCÉDURE OUT — Extraction fluide requise",
-        "HOLD": "PROCÉDURE HOLD — Maintien des vannes",
-    }
-    return {
-        "operational_state": "OPERATIONNEL",
-        "state_message": (
-            f"{proc_txt.get(procedure,'—')} | "
-            f"ZP={zp:.3f} | NDT={ndt:.3f} | ERV={erv:.3f} | HEP={hep:.3f} bar"
-        ),
-        "inhibited":         False,
-        "inhibit_reason":    None,
-        "zeroing_point":     zp,
-        "ndt":               ndt,
-        "erv":               erv,
-        "hep":               hep,
-        "procedure":         procedure,
-        "zeroing_direction": z_dir,
-        "computed_at":       ts,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §7  ACQUISITION API
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _build_api_headers() -> dict:
-    """
-    Construit les headers HTTP d'authentification depuis st.secrets.
-    Clés requises dans [api_xa_uusd] : api_key (+ optionnel client_id).
-    """
-    try:
-        api_key   = st.secrets["api_xa_uusd"]["api_key"]
-        client_id = st.secrets["api_xa_uusd"].get("client_id", "XA-UUSD-CTRL")
-    except KeyError as e:
-        raise KeyError(
-            "Secret manquant : [api_xa_uusd].api_key absent de secrets.toml"
-        ) from e
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "X-Client-ID":   client_id,
-        "Accept":        "application/json",
-        "Content-Type":  "application/json",
-    }
-
-
-def get_fluid_absolute_pressure():
-    """Récupération de la pression réelle via le flux XAUUSD"""
-    import json
-    import requests
-    try:
-        token = st.secrets["api_xa_uusd"]["api_key"]
-        # Configuration du capteur réel (XAUUSD)
-        query = json.dumps({"data":{"code":"XAUUSD","kline_type":1,"kline_timestamp_end":0,"query_kline_num":1}})
-        url = f"https://quote.alltick.co/quote-b-api/kline?token={token}&query={query}"
-        
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        if data.get("ret") == 200:
-            # Extraction de la pression absolue (Prix de clôture)
-            pressure = float(data["data"]["kline_list"]["kline_data"]["close_price"])
-            return pressure
-        else:
-            return None
-    except Exception as e:
-        st.error(f"Erreur de capteur : {e}")
-        return Nonedef _render_static_header() -> None:
-    """Bandeau titre statique — rendu une seule fois au chargement de la page."""
-    c_logo, c_title, c_badge = st.columns([0.07, 0.63, 0.30])
-
-    with c_logo:
-        st.markdown(
-            '<div style="font-size:2.8rem;line-height:1;padding-top:6px;">⬡</div>',
-            unsafe_allow_html=True,
-        )
-    with c_title:
-        st.markdown(
-            '<div class="xa-title">Contrôle Hydrodynamique<br>'
-            '<span class="accent">XA-UUSD</span></div>'
-            '<div class="xa-subtitle">'
-            'PIPELINE EXPÉRIMENTAL · TÉLÉMÉTRIE · STOCHASTIQUE · INTERVENTION · '
-            'FRAGMENT LIVE v4'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-    with c_badge:
-        # Badge statique de démarrage — le fragment actualisera son propre badge
-        st.markdown(
-            '<div style="text-align:right;padding-top:10px;">'
-            '<span class="status-badge" '
-            'style="border-color:#1E2A40;color:#6B7FA3;">○ INITIALISATION</span>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-
-def _render_static_sidebar() -> None:
-    """
-    Sidebar statique — compteurs, paramètres de calibration, journal.
-    Le journal est lu depuis session_state et se rafraîchit à chaque rerun
-    déclenché par le fragment.
-    """
-    st.sidebar.markdown(
-        '<div class="xa-title" style="font-size:1.1rem;">◈ Diagnostics<br>Système</div>',
-        unsafe_allow_html=True,
-    )
-    st.sidebar.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    total  = st.session_state["total_api_calls"]
-    failed = st.session_state["failed_api_calls"]
-    succ   = total - failed
-    rate   = succ / total * 100.0 if total > 0 else 0.0
-
-    st.sidebar.metric("Appels API",       total)
-    st.sidebar.metric("Succès",           succ)
-    st.sidebar.metric("Taux succès",      f"{rate:.1f} %")
-    st.sidebar.metric("Échecs",           failed)
-    st.sidebar.metric("Cycles fragment",  st.session_state["fragment_cycle"])
-    st.sidebar.metric("Inhibitions ⚠",   st.session_state["inhibit_count"])
-
-    df = st.session_state["pressure_history_df"]
-    if len(df) >= 2:
-        st.sidebar.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-        st.sidebar.metric("P min",   f"{df['pressure_bar'].min():.3f} bar")
-        st.sidebar.metric("P max",   f"{df['pressure_bar'].max():.3f} bar")
-        st.sidebar.metric("σ global",f"{df['pressure_bar'].std():.4f} bar")
-
-    # Paramètres de calibration (lecture seule)
-    st.sidebar.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-    st.sidebar.markdown(
-        '<div class="metric-label" style="margin-bottom:8px;">Calibration</div>',
-        unsafe_allow_html=True,
-    )
-    st.sidebar.markdown(
-        f'<div class="log-entry">σ_inhibit  = {TURBULENCE_INHIBIT_THRESHOLD:.2f} bar</div>'
-        f'<div class="log-entry">NDT ratio  = {NDT_VOLATILITY_RATIO}</div>'
-        f'<div class="log-entry">ERV mult.  = {ERV_SAFETY_MULTIPLIER}×</div>'
-        f'<div class="log-entry">HEP offset = {HEP_FRICTION_OFFSET_BAR} bar</div>'
-        f'<div class="log-entry">Fragment   = {FRAGMENT_INTERVAL}</div>',
-        unsafe_allow_html=True,
-    )
-
-    # Journal d'événements
-    st.sidebar.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-    st.sidebar.markdown(
-        '<div class="metric-label" style="margin-bottom:8px;">Journal temps réel</div>',
-        unsafe_allow_html=True,
-    )
-    log = st.session_state["event_log"]
-    if not log:
-        st.sidebar.markdown(
-            '<div class="log-entry">Aucun événement.</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        for ts, lvl, msg in reversed(log[-20:]):
-            st.sidebar.markdown(
-                f'<div class="log-entry {lvl}">[{ts}] {msg}</div>',
-                unsafe_allow_html=True,
-            )
-
-    # Erreur fragment si présente
-    if st.session_state.get("last_fragment_error"):
-        st.sidebar.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-        st.sidebar.error(
-            f"⚠ Dernière erreur fragment :\n"
-            f"{st.session_state['last_fragment_error']}"
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §10  LIVE CONTROL DASHBOARD — FRAGMENT @st.fragment(run_every="5s")
-#
-#  Ce bloc est le cœur opérationnel de l'interface v4.
-#  Il s'exécute de façon autonome toutes les 5 secondes sans déclencher
-#  un rerun complet de la page, garantissant :
-#    · Zéro rechargement du layout statique (header, sidebar, graphiques)
-#    · Isolation du fil d'exécution → pas de blocage du thread principal
-#    · Cache navigateur préservé (Streamlit ne régénère pas les ressources
-#      statiques non incluses dans le fragment)
-# ──────────────────────────────────────────────────────────────────────────────
-
-@st.fragment(run_every=FRAGMENT_INTERVAL)
-def live_control_dashboard() -> None:
-    """
-    Dashboard de contrôle live — sub-routine fragmentée @st.fragment(5 s).
-
-    Chaque cycle effectue dans l'ordre :
-      1. Acquisition pression via get_fluid_absolute_pressure() (try/except)
-      2. Calcul stochastique (turbulence, %K/%D, drift GBM)
-      3. Calcul seuils d'intervention (ZP / NDT / ERV / HEP)
-      4. Rendu du panneau d'état opérationnel (ACTION / PAUSE / HOLD)
-      5. Affichage des 5 st.metric principaux (pression + 4 coordonnées)
-      6. Graphique pression historique avec niveaux d'intervention superposés
-      7. Rangée KPI stochastique (%K, %D, σ, drift)
-      8. Analyse GBM détaillée
-      9. Tableau récapitulatif des coordonnées d'actionnement opérateur
-
-    Toutes les opérations réseau et de calcul sont enveloppées dans des
-    blocs try/except granulaires pour garantir qu'aucune exception ne
-    provoque l'effondrement de l'interface graphique.
-    """
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-
-    # ── Incrément du compteur de cycles fragment ──────────────────────────
-    st.session_state["fragment_cycle"] += 1
-    cycle = st.session_state["fragment_cycle"]
-
-    # ── Ticker de synchronisation ─────────────────────────────────────────
-    now_utc = datetime.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     st.markdown(
-        f'<div class="fragment-tick">'
-        f'<span class="tick-dot"></span>'
-        f'FRAGMENT CYCLE #{cycle} — {now_utc} UTC — '
-        f'Intervalle : {FRAGMENT_INTERVAL}'
+        f'<div class="reconnect-panel">'
+        f'<div class="reconnect-title">⟳ RE-CONNEXION AU CAPTEUR</div>'
+        f'<div class="reconnect-dots">'
+        f'<span></span><span></span><span></span>'
+        f'</div>'
+        f'<div class="reconnect-sub" style="margin-top:8px;">'
+        f'{f"MOTIF : {reason}<br>" if reason else ""}'
+        f'Dernière tentative : {ts}'
+        f'{f"  ·  Cycle #{retry}" if retry else ""}'
+        f'</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  ACQUISITION + CALCUL PIPELINE (try/except global fragment)
-    # ══════════════════════════════════════════════════════════════════════
-    pressure:   Optional[float] = None
-    latency_ms: float           = 0.0
-    api_error:  Optional[str]   = None
-    sr:         Optional[dict]  = None
-    th:         Optional[dict]  = None
 
-    # ── Appel API avec capture d'exception réseau ─────────────────────────
+def _safe_chart(fig_fn, *args, **kwargs) -> go.Figure:
+    """
+    Execute a chart-builder function inside a try/except.
+    Returns an empty Figure on any error so the UI never breaks.
+    """
     try:
-        pressure, latency_ms, api_error = get_fluid_absolute_pressure()
-        st.session_state["total_api_calls"] += 1
+        return fig_fn(*args, **kwargs)
+    except Exception as e:
+        _log_error(f"[CHART ERR] {fig_fn.__name__}: {e}")
+        return go.Figure()
 
-        if api_error is not None:
-            st.session_state["failed_api_calls"] += 1
-            _append_event_log("err", f"[Fragment #{cycle}] API — {api_error}")
-        else:
-            ts_now = datetime.datetime.utcnow()
-            st.session_state["pressure_history_df"] = append_pressure_record(
-                df=st.session_state["pressure_history_df"],
-                pressure=pressure, latency_ms=latency_ms, ts=ts_now,
-            )
-            st.session_state["last_successful_ts"] = (
-                ts_now.strftime("%H:%M:%S.%f")[:-3] + " UTC"
-            )
-            status_p = _classify_pressure_status(pressure)
-            lvl_p = "ok" if status_p == "nominal" else (
-                "wrn" if status_p == "warning" else "err"
-            )
-            _append_event_log(
-                lvl_p,
-                f"[#{cycle}] {pressure:.3f} bar | lat {latency_ms:.1f} ms | "
-                f"{status_p.upper()}",
-            )
-            st.session_state["last_fragment_error"] = None
+COLOR_UP          = "#00FF41"
+COLOR_DOWN        = "#FF3C3C"
+COLOR_CYAN        = "#00E5FF"
+COLOR_AMBER       = "#FFB300"
+COLOR_PURPLE      = "#BF5FFF"
+COLOR_VOLUME_UP   = "rgba(0,255,65,0.35)"
+COLOR_VOLUME_DOWN = "rgba(255,60,60,0.35)"
+COLOR_BG          = "#000000"
+COLOR_GRID        = "rgba(0,255,65,0.07)"
+COLOR_AXIS        = "rgba(0,255,65,0.35)"
+FONT_MONO         = "Share Tech Mono, monospace"
 
-    except Exception as exc_api:
-        st.session_state["last_fragment_error"] = str(exc_api)
-        _append_event_log("err", f"[Fragment #{cycle}] Exception API : {exc_api}")
 
-    # ── Calcul stochastique avec capture d'exception ──────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA STRUCTURES
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class GBMResult:
+    """Geometric Brownian Motion analytics output."""
+    mu:             float      = 0.0
+    sigma:          float      = 0.0
+    mu_instant:     np.ndarray = field(default_factory=lambda: np.array([]))
+    sigma_rolling:  np.ndarray = field(default_factory=lambda: np.array([]))
+    log_returns:    np.ndarray = field(default_factory=lambda: np.array([]))
+    variance_window:np.ndarray = field(default_factory=lambda: np.array([]))
+    valid:          bool       = False
+
+
+@dataclass
+class OUResult:
+    """Ornstein-Uhlenbeck relaxation model output."""
+    theta:    float      = 0.0
+    mu_eq:    float      = 0.0
+    sigma_ou: float      = 0.0
+    half_life:float      = 0.0
+    residuals:np.ndarray = field(default_factory=lambda: np.array([]))
+    ou_path:  np.ndarray = field(default_factory=lambda: np.array([]))
+    regime:   str        = "NEUTRAL"
+    valid:    bool       = False
+
+
+@dataclass
+class TurbulenceResult:
+    """Second-derivative pressure-acceleration anomaly filter output."""
+    acceleration: np.ndarray = field(default_factory=lambda: np.array([]))
+    accel_zscore: np.ndarray = field(default_factory=lambda: np.array([]))
+    anomaly_mask: np.ndarray = field(default_factory=lambda: np.array([], dtype=bool))
+    anomaly_count:int        = 0
+    latest_flag:  bool       = False
+    valid:        bool       = False
+
+
+@dataclass
+class FluidKineticsReport:
+    """Aggregated container for all stochastic analytics."""
+    gbm:        GBMResult        = field(default_factory=GBMResult)
+    ou:         OUResult         = field(default_factory=OUResult)
+    turbulence: TurbulenceResult = field(default_factory=TurbulenceResult)
+    calc_ms:    float            = 0.0
+
+
+@dataclass
+class ActionCoordinates:
+    """
+    Actuation coordinates for the field engineer.
+
+    Four threshold levels derived from GBM σ, OU θ, and Stochastic %K/%D.
+
+    ENTRY  — Point d'Injection
+        Long  : %K crosses %D upward below STOCH_EXHAUSTION_ZONE (< 20)
+                AND OU θ > 0.15 (compression imminente)
+        Short : %K crosses %D downward above STOCH_OVERBOUGHT_ZONE (> 80)
+                AND OU θ > 0.15
+
+    NDT    — Seuil de Décompression Nominale (Take Profit)
+        NDT  = entry  ±  NDT_SIGMA_MULTIPLE × σ_ann × entry
+             = entry  ±  2.5 × σ_GBM × entry
+
+    ERV    — Soupape de Sécurité (Stop Loss / Rupture irrévocable)
+        ERV  = entry  ∓  ERV_SIGMA_MULTIPLE × σ_ann × entry
+             = entry  ∓  1.5 × σ_GBM × entry
+
+    HEP    — Équilibre Hydrostatique (Break Even)
+        HEP  = entry  ×  (1  +  HEP_FRICTION_OFFSET)
+             = entry  ×  1.002   (0.2% spread/frais compensation)
+
+    INHIBITED — turbulence.latest_flag == True
+        All price values zeroed; system locked; PAUSE DE SÉCURITÉ emitted.
+    """
+    entry:          float  = 0.0
+    ndt:            float  = 0.0
+    erv:            float  = 0.0
+    hep:            float  = 0.0
+    direction:      str    = "WAIT"     # LONG | SHORT | WAIT
+    stoch_k:        float  = 50.0
+    stoch_d:        float  = 50.0
+    k_crosses_d:    bool   = False
+    ou_theta:       float  = 0.0
+    sigma_ann:      float  = 0.0
+    inhibited:      bool   = False
+    inhibit_reason: str    = ""
+    signal_active:  bool   = False
+    rr_ratio:       float  = 0.0       # Risk/Reward = |NDT-entry| / |ERV-entry|
+    valid:          bool   = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE INITIALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+if "kline_cache_1m"   not in st.session_state:
+    st.session_state["kline_cache_1m"]   = pd.DataFrame()
+if "kline_cache_5m"   not in st.session_state:
+    st.session_state["kline_cache_5m"]   = pd.DataFrame()
+if "last_price"       not in st.session_state:
+    st.session_state["last_price"]       = 0.0
+if "prev_price"       not in st.session_state:
+    st.session_state["prev_price"]       = 0.0
+if "tick_count"       not in st.session_state:
+    st.session_state["tick_count"]       = 0
+if "error_log"        not in st.session_state:
+    st.session_state["error_log"]        = []
+if "api_latency_ms"   not in st.session_state:
+    st.session_state["api_latency_ms"]   = 0.0
+if "kinetics_cache"   not in st.session_state:
+    st.session_state["kinetics_cache"]   = FluidKineticsReport()
+if "action_coords"    not in st.session_state:
+    st.session_state["action_coords"]    = ActionCoordinates()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_api_key() -> str:
     try:
-        df_snap = st.session_state["pressure_history_df"]
-        if len(df_snap) >= 1:
-            sr = run_stochastic_engine(df_snap)
-            st.session_state["stoch_results"] = sr
-    except Exception as exc_stoch:
-        _append_event_log("err", f"[#{cycle}] Stochastique : {exc_stoch}")
-        sr = st.session_state.get("stoch_results")  # fallback sur cache
+        return st.secrets["api_xa_uusd"]["api_key"]
+    except KeyError as exc:
+        raise RuntimeError(
+            "Secret 'api_xa_uusd.api_key' not found. "
+            "Add to .streamlit/secrets.toml:\n"
+            "[api_xa_uusd]\napi_key = \"YOUR_TOKEN\""
+        ) from exc
 
-    # ── Calcul seuils d'intervention avec capture d'exception ─────────────
+
+def _build_kline_params(interval: str, count: int) -> dict:
+    return {
+        "token": _get_api_key(),
+        "query": json.dumps({
+            "trace": f"xau-quantum-{int(time.time())}",
+            "data": {
+                "code":                SYMBOL,
+                "kline_type":          int(interval),
+                "kline_timestamp_end": 0,
+                "query_kline_num":     count,
+                "adjust_type":         0,
+            }
+        }),
+    }
+
+
+def fetch_quantum_telemetry(interval: str = INTERVAL_1M) -> pd.DataFrame:
+    """
+    Retrieve XAUUSD K-line candles from the AllTick real API.
+    URL  : GET https://quote.tradeswitcher.com/quote-b-api/kline
+    Auth : query param 'token' = st.secrets["api_xa_uusd"]["api_key"]
+    Returns pd.DataFrame[timestamp, open, high, low, close, volume]
+    or empty DataFrame on any failure.
+    """
+    t0 = time.perf_counter()
     try:
-        if (pressure is not None and api_error is None
-                and sr is not None and not math.isnan(sr["k_last"])):
-            th = calculate_intervention_thresholds(
-                current_pressure = pressure,
-                volatility       = sr["turbulence_last"],
-                stoch_k          = sr["k_last"],
-                stoch_d          = sr["d_last"],
-                drift            = sr["drift"],
-            )
-            st.session_state["intervention_thresholds"] = th
+        params   = _build_kline_params(interval, CANDLE_FETCH_COUNT)
+        response = requests.get(
+            url     = f"{ALLTICK_BASE_URL}{ALLTICK_KLINE_PATH}",
+            params  = params,
+            timeout = 8,
+            headers = {
+                "Accept":     "application/json",
+                "User-Agent": "XAU-QUANTUM-DASHBOARD/2.0",
+            },
+        )
+        st.session_state["api_latency_ms"] = round(
+            (time.perf_counter() - t0) * 1000, 2
+        )
+        response.raise_for_status()
+        payload  = response.json()
+        raw_list = payload.get("data", {}).get("kline_list", [])
+        if not raw_list:
+            _log_error(f"[WARN] Empty kline_list. Keys: {list(payload.keys())}")
+            return pd.DataFrame()
 
-            if th["inhibited"]:
-                st.session_state["inhibit_count"] += 1
-                _append_event_log(
-                    "inh",
-                    f"[#{cycle}] !!! INHIBITION #{st.session_state['inhibit_count']} — "
-                    f"{th['inhibit_reason'][:80]}",
-                )
-            else:
-                _append_event_log(
-                    "ok",
-                    f"[#{cycle}] ZP={th['zeroing_point']:.3f} "
-                    f"NDT={th['ndt']:.3f} ERV={th['erv']:.3f} "
-                    f"HEP={th['hep']:.3f} Proc.{th['procedure']}",
-                )
-        else:
-            # Utiliser le cache si pas de nouvelles données
-            th = st.session_state.get("intervention_thresholds")
+        df = pd.DataFrame(raw_list)
+        df.rename(columns={
+            "open_price":  "open",
+            "close_price": "close",
+            "high_price":  "high",
+            "low_price":   "low",
+        }, inplace=True)
 
-    except ValueError as ve:
-        _append_event_log("err", f"[#{cycle}] Seuils : {ve}")
-        th = st.session_state.get("intervention_thresholds")
-    except Exception as exc_th:
-        _append_event_log("err", f"[#{cycle}] Exception seuils : {exc_th}")
-        th = st.session_state.get("intervention_thresholds")
+        required = {"timestamp", "open", "high", "low", "close"}
+        if not required.issubset(df.columns):
+            _log_error(f"[WARN] Missing cols. Got: {list(df.columns)}")
+            return pd.DataFrame()
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  RENDU UI — PANNEAU D'ÉTAT OPÉRATIONNEL
-    # ══════════════════════════════════════════════════════════════════════
-    st.markdown(
-        '<div class="section-header live">'
-        '⚡ Salle de Contrôle Live — Panneau Manuel Vannes XA-UUSD'
-        '</div>',
-        unsafe_allow_html=True,
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["volume"] = (
+            pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+            if "volume" in df.columns else 0.0
+        )
+        df["timestamp"] = pd.to_datetime(
+            pd.to_numeric(df["timestamp"], errors="coerce"),
+            unit="s", utc=True,
+        )
+        df.dropna(subset=["timestamp", "open", "high", "low", "close"], inplace=True)
+        df.sort_values("timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    except requests.exceptions.Timeout:
+        _log_error("[ERR] Timeout — no response within 8 s")
+    except requests.exceptions.ConnectionError as e:
+        _log_error(f"[ERR] ConnectionError: {e}")
+    except requests.exceptions.HTTPError as e:
+        _log_error(f"[ERR] HTTP {e.response.status_code}: {e.response.text[:200]}")
+    except (ValueError, KeyError, TypeError) as e:
+        _log_error(f"[ERR] Parse: {e}")
+    except Exception as e:
+        _log_error(f"[ERR] {type(e).__name__}: {e}")
+    return pd.DataFrame()
+
+
+def _log_error(msg: str) -> None:
+    ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    entry = f"{ts}  {msg}"
+    st.session_state["error_log"].append(entry)
+    if len(st.session_state["error_log"]) > 40:
+        st.session_state["error_log"] = st.session_state["error_log"][-40:]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║            FLUID KINETICS  —  STOCHASTIC ANALYTICAL ENGINE               ║
+# ║   GBM  (Geometric Brownian Motion)  +  OU  (Ornstein-Uhlenbeck)          ║
+# ║   +  Turbulence Filter  (second-derivative anomaly detection)             ║
+# ║   All computation in pure NumPy — target latency < 50 ms                 ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_gbm(prices: np.ndarray, window: int = GBM_WINDOW) -> GBMResult:
+    """
+    Geometric Brownian Motion parameter extraction.
+
+    Model (continuous SDE):
+        dS_t = μ · S_t · dt  +  σ · S_t · dW_t
+
+    Log-space equivalent (Itô lemma):
+        d(ln S_t) = (μ − σ²/2) · dt  +  σ · dW_t
+        r_t ≡ ln(S_t / S_{t-1})  ∼  N((μ − σ²/2)·Δt,  σ²·Δt)
+
+    Algorithm
+    ──────────
+    1.  r_t  = diff(ln(prices))                 → log-return vector  [n-1]
+    2.  μ̂   = mean(r_t)  [per-period drift]
+        σ̂   = std(r_t, ddof=1)  [per-period volatility]
+    3.  Sliding window of `window` cycles via NumPy stride tricks:
+        • builds view matrix  W[i, :] = r_t[i : i+window]   — zero-copy
+        • variance_window[i] = Var(W[i, :])                  — instantaneous σ²
+        • sigma_rolling[i]   = sqrt(variance_window[i])
+        • mu_instant[i]      = mean(W[i, :])
+    4.  Annualise:
+        μ_ann  = μ̂  × 252
+        σ_ann  = σ̂  × √252
+        (convention: 252 trading days; for 1M candles this is a normalisation
+         factor — the relative magnitudes remain comparable across timeframes)
+    """
+    result = GBMResult()
+    n = len(prices)
+    if n < window + 2:
+        return result
+
+    # Step 1 — log-returns  (shape: n-1,  dtype: float64)
+    log_ret: np.ndarray = np.diff(np.log(prices))
+
+    # Step 2 — global drift and volatility
+    mu_raw:    float = float(np.mean(log_ret))
+    sigma_raw: float = float(np.std(log_ret, ddof=1))
+    if sigma_raw < 1e-14:
+        return result
+
+    # Step 3 — rolling window via stride tricks  (zero-copy view)
+    n_ret:  int = len(log_ret)
+    n_wins: int = n_ret - window + 1
+    strides = (log_ret.strides[0], log_ret.strides[0])
+    win_mat: np.ndarray = np.lib.stride_tricks.as_strided(
+        log_ret,
+        shape   = (n_wins, window),
+        strides = strides,
+    )
+    variance_window: np.ndarray = np.var(win_mat,  axis=1, ddof=1)
+    mu_rolling:      np.ndarray = np.mean(win_mat, axis=1)
+    sigma_rolling:   np.ndarray = np.sqrt(variance_window)
+
+    # Step 4 — annualise
+    ann = 252.0
+    result.mu              = mu_raw    * ann
+    result.sigma           = sigma_raw * np.sqrt(ann)
+    result.mu_instant      = mu_rolling    * ann
+    result.sigma_rolling   = sigma_rolling * np.sqrt(ann)
+    result.log_returns     = log_ret
+    result.variance_window = variance_window
+    result.valid           = True
+    return result
+
+
+def _compute_ou(prices: np.ndarray) -> OUResult:
+    """
+    Ornstein-Uhlenbeck mean-reversion parameter estimation.
+
+    Continuous SDE:
+        dX_t = θ · (μ − X_t) · dt  +  σ · dW_t
+
+    Euler-Maruyama discretisation (Δt = 1 period):
+        X_{t+1} − X_t = θ·μ·Δt  −  θ·Δt·X_t  +  ε_t
+
+    Recast as OLS  (linear regression):
+        ΔX_t = α  +  β · X_t  +  ε_t
+    where:
+        α = θ · μ · Δt     →   μ_eq  =  −α / β
+        β = −θ · Δt        →   θ     =  −β          (Δt = 1 by construction)
+        σ_ou = std(ε_t, ddof=1)
+
+    Half-life of mean-reversion:
+        T½ = ln(2) / θ  [in periods]
+
+    Regime classification
+    ─────────────────────
+    θ > 0.15 AND |X_last − μ_eq| > 0.5·σ_ou  →  EXPLOSIVE_COMPRESSION
+        Fluid is displaced far from equilibrium; high snap-back force.
+    θ > 0.15 AND |X_last − μ_eq| ≤ 0.5·σ_ou  →  RETURN_TO_REST
+        Fluid is near equilibrium; damped oscillation around μ_eq.
+    θ ≤ 0.15                                  →  NEUTRAL
+        Near-unit-root; very slow or no detectable mean-reversion.
+
+    Note: if β ≥ 0 the process is non-stationary (unit root / explosive);
+    the OU assumption is violated and valid=False is returned.
+    """
+    result = OUResult()
+    n = len(prices)
+    if n < OU_MIN_SAMPLES + 1:
+        return result
+
+    X:  np.ndarray = prices[:-1].astype(np.float64)   # X_t
+    dX: np.ndarray = np.diff(prices).astype(np.float64)  # ΔX_t
+
+    # OLS normal equations  β̂ = (AᵀA)⁻¹ Aᵀ dX
+    ones: np.ndarray = np.ones(len(X), dtype=np.float64)
+    A:    np.ndarray = np.column_stack([ones, X])       # design matrix (n-1, 2)
+    coeffs, _, rank, _ = np.linalg.lstsq(A, dX, rcond=None)
+
+    alpha: float = float(coeffs[0])
+    beta:  float = float(coeffs[1])
+
+    if beta >= 0.0:
+        # Non-stationary: unit root or explosive regime
+        result.regime = "NEUTRAL"
+        result.valid  = False
+        return result
+
+    theta:    float = -beta
+    mu_eq:    float = -alpha / beta
+    eps:      np.ndarray = dX - (alpha + beta * X)
+    sigma_ou: float = float(np.std(eps, ddof=1))
+    half_life:float = float(np.log(2.0) / theta) if theta > 1e-9 else float("inf")
+
+    # OU theoretical path (Euler-Maruyama deterministic skeleton, no noise)
+    ou_path: np.ndarray = np.empty(n - 1, dtype=np.float64)
+    ou_path[0] = prices[0]
+    for i in range(1, n - 1):
+        ou_path[i] = ou_path[i - 1] + theta * (mu_eq - ou_path[i - 1])
+
+    # Regime classification
+    x_last    = float(prices[-1])
+    deviation = abs(x_last - mu_eq)
+    if theta > 0.15 and deviation > 0.5 * sigma_ou:
+        regime = "EXPLOSIVE_COMPRESSION"
+    elif theta > 0.15:
+        regime = "RETURN_TO_REST"
+    else:
+        regime = "NEUTRAL"
+
+    result.theta     = round(theta,    6)
+    result.mu_eq     = round(mu_eq,    4)
+    result.sigma_ou  = round(sigma_ou, 6)
+    result.half_life = round(half_life, 2)
+    result.residuals = eps
+    result.ou_path   = ou_path
+    result.regime    = regime
+    result.valid     = True
+    return result
+
+
+def _compute_turbulence(prices: np.ndarray) -> TurbulenceResult:
+    """
+    Second-derivative pressure-acceleration anomaly filter.
+
+    Physical analogy:
+        S(t)  = position (price / pressure)
+        v(t)  = dS/dt   ≈ S_t − S_{t-1}         (first finite difference)
+        a(t)  = d²S/dt² ≈ S_{t+1} − 2S_t + S_{t-1}   (second finite difference)
+
+    Algorithm
+    ──────────
+    1.  a_t = prices[2:] − 2·prices[1:-1] + prices[:-2]     (shape: n-2)
+    2.  z_t = (a_t − mean(a)) / std(a)                       standardise
+    3.  anomaly_mask[t] = True  iff  |z_t| > TURB_ACCEL_STD_THRESH  (2.5σ)
+    4.  latest_flag = anomaly_mask[-1]   → real-time turbulence status
+
+    Flag label: "INSTABILITÉ TURBULENTE DÉTECTÉE"
+    """
+    result = TurbulenceResult()
+    n = len(prices)
+    if n < 5:
+        return result
+
+    # Second finite difference
+    accel: np.ndarray = (
+        prices[2:].astype(np.float64)
+        - 2.0 * prices[1:-1].astype(np.float64)
+        + prices[:-2].astype(np.float64)
     )
 
-    # ── Alerte API si erreur ──────────────────────────────────────────────
-    if api_error is not None:
-        st.warning(
-            f"⚠ **Interruption réseau momentanée** — Cycle #{cycle}\n\n"
-            f"`{api_error}`\n\n"
-            f"Les seuils affichés ci-dessous sont issus du dernier cycle "
-            f"valide. L'interface reste opérationnelle.",
-            icon="📡",
-        )
+    mu_a:    float = float(np.mean(accel))
+    sigma_a: float = float(np.std(accel, ddof=1))
+    if sigma_a < 1e-12:
+        return result
 
-    # ── Panneau ACTION / PAUSE / HOLD ─────────────────────────────────────
-    if th is not None:
-        if th["inhibited"]:
-            panel_css      = "inhibit"
-            headline_css   = "inhibit"
-            icon           = "🛑"
-            headline_text  = "PAUSE DE SÉCURITÉ"
-            detail_lines   = [
-                "CHAOS CINÉTIQUE DÉTECTÉ — SUSPENDRE TOUTE INTERVENTION SUR LES VANNES",
-                th.get("inhibit_reason", ""),
-                f"Seuil d'inhibition : σ_turb > {TURBULENCE_INHIBIT_THRESHOLD:.2f} bar",
-            ]
-            proc_badge_html = (
-                '<span class="action-proc-badge proc-hold">VANNES BLOQUÉES</span>'
-            )
-        elif th["procedure"] == "HOLD":
-            panel_css      = "hold"
-            headline_css   = "hold"
-            icon           = "⏸"
-            headline_text  = "SYSTÈME STABLE — MAINTIEN DES VANNES"
-            detail_lines   = [
-                th["state_message"],
-                f"Drift : {th['zeroing_direction'].upper()} | "
-                f"Calculé : {th['computed_at']}",
-            ]
-            proc_badge_html = (
-                '<span class="action-proc-badge proc-hold">PROCÉDURE HOLD</span>'
-            )
-        else:
-            panel_css      = "required"
-            headline_css   = "required"
-            icon           = "🔧"
-            headline_text  = "ACTION REQUISE SUR LE PANEL MANUEL"
-            detail_lines   = [
-                th["state_message"],
-                f"Sens cinétique : {th['zeroing_direction'].upper()} | "
-                f"Calculé : {th['computed_at']}",
-            ]
-            proc_css_map = {"IN": "proc-in", "OUT": "proc-out"}
-            proc_badge_html = (
-                f'<span class="action-proc-badge '
-                f'{proc_css_map.get(th["procedure"], "proc-hold")}">'
-                f'PROCÉDURE {th["procedure"]} ACTIVÉE</span>'
-            )
+    z:     np.ndarray = (accel - mu_a) / sigma_a
+    flags: np.ndarray = np.abs(z) > TURB_ACCEL_STD_THRESH
 
-        detail_html = "".join(
-            f'<div class="action-detail">{l}</div>' for l in detail_lines if l
-        )
+    result.acceleration  = accel
+    result.accel_zscore  = z
+    result.anomaly_mask  = flags
+    result.anomaly_count = int(np.sum(flags))
+    result.latest_flag   = bool(flags[-1]) if len(flags) > 0 else False
+    result.valid         = True
+    return result
+
+
+def analyze_fluid_kinetics(data: pd.DataFrame) -> FluidKineticsReport:
+    """
+    Master stochastic analytical pipeline.
+
+    Accepts an enriched OHLCV DataFrame; extracts the close-price vector;
+    runs the three sub-engines (GBM → OU → Turbulence) in sequence using
+    pure NumPy matrix operations to guarantee < 50 ms computation latency.
+
+    Parameters
+    ──────────
+    data : pd.DataFrame  with column 'close' and ≥ OU_MIN_SAMPLES + 2 rows.
+
+    Returns
+    ───────
+    FluidKineticsReport  with populated gbm, ou, turbulence fields and
+    calc_ms (measured wall-clock execution time in milliseconds).
+    """
+    report = FluidKineticsReport()
+    if data.empty or "close" not in data.columns:
+        return report
+    if len(data) < OU_MIN_SAMPLES + 2:
+        return report
+
+    t_start = time.perf_counter()
+
+    # C-contiguous float64 array — required for stride tricks
+    prices: np.ndarray = np.ascontiguousarray(
+        data["close"].to_numpy(dtype=np.float64)
+    )
+
+    report.gbm        = _compute_gbm(prices, window=GBM_WINDOW)
+    report.ou         = _compute_ou(prices)
+    report.turbulence = _compute_turbulence(prices)
+
+    report.calc_ms = round((time.perf_counter() - t_start) * 1000, 3)
+    return report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLASSIC TECHNICAL INDICATORS
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    avg_g = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_l = loss.ewm(com=period - 1, adjust=False).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(
+    series: pd.Series,
+    fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    ema_f = compute_ema(series, fast)
+    ema_s = compute_ema(series, slow)
+    macd  = ema_f - ema_s
+    sig   = compute_ema(macd, signal)
+    return macd, sig, macd - sig
+
+
+def compute_bollinger(
+    series: pd.Series, period: int = 20, std_dev: float = 2.0
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    mid = series.rolling(period).mean()
+    s   = series.rolling(period).std()
+    return mid + std_dev * s, mid, mid - std_dev * s
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"]  - df["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+
+def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or len(df) < 5:
+        return df
+    c = df["close"]
+    df["ema9"]  = compute_ema(c, 9)
+    df["ema21"] = compute_ema(c, 21)
+    df["ema50"] = compute_ema(c, 50)
+    df["rsi14"] = compute_rsi(c, 14)
+    df["macd"], df["macd_signal"], df["macd_hist"] = compute_macd(c)
+    df["bb_up"], df["bb_mid"], df["bb_low"]         = compute_bollinger(c)
+    df["atr14"]     = compute_atr(df, 14)
+    df["up_candle"] = df["close"] >= df["open"]
+    # ── Stochastic Oscillator %K / %D ────────────────────────────────────
+    # %K = 100 × (Close − Lowest_Low[K]) / (Highest_High[K] − Lowest_Low[K])
+    # %D = SMA(%K, D_period)
+    k_p = STOCH_K_PERIOD
+    d_p = STOCH_D_PERIOD
+    lowest_low   = df["low"].rolling(k_p).min()
+    highest_high = df["high"].rolling(k_p).max()
+    denom        = (highest_high - lowest_low).replace(0, np.nan)
+    df["stoch_k"] = 100.0 * (df["close"] - lowest_low) / denom
+    df["stoch_d"] = df["stoch_k"].rolling(d_p).mean()
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHART BUILDERS
+# ─────────────────────────────────────────────────────────────────────────────
+_BASE = dict(
+    paper_bgcolor = COLOR_BG,
+    plot_bgcolor  = COLOR_BG,
+    font          = dict(family=FONT_MONO, color=COLOR_UP, size=10),
+    margin        = dict(l=8, r=8, t=28, b=8),
+    xaxis = dict(showgrid=True, gridcolor=COLOR_GRID, gridwidth=1,
+                 color=COLOR_AXIS, tickfont=dict(family=FONT_MONO, size=9),
+                 zeroline=False, showspikes=True,
+                 spikecolor=COLOR_UP, spikethickness=1),
+    yaxis = dict(showgrid=True, gridcolor=COLOR_GRID, gridwidth=1,
+                 color=COLOR_AXIS, tickfont=dict(family=FONT_MONO, size=9),
+                 zeroline=False, side="right",
+                 showspikes=True, spikecolor=COLOR_UP, spikethickness=1),
+    legend = dict(bgcolor="rgba(0,0,0,0.6)",
+                  bordercolor="rgba(0,255,65,0.3)", borderwidth=1,
+                  font=dict(family=FONT_MONO, size=9, color=COLOR_UP)),
+    hovermode  = "x unified",
+    hoverlabel = dict(bgcolor="#050F05",
+                      font=dict(family=FONT_MONO, size=10, color=COLOR_UP),
+                      bordercolor=COLOR_UP),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║        ACTION COORDINATE ENGINE  —  Bloc 3                               ║
+# ║  Entry · NDT · ERV · HEP  +  Safety Inhibition Logic                    ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_action_coordinates(
+    df: pd.DataFrame,
+    report: FluidKineticsReport,
+) -> ActionCoordinates:
+    """
+    Derive the four actuation thresholds from live telemetry + kinetics report.
+
+    ══════════════════════════════════════════════════════════════════════
+    INHIBITION LOGIC  (highest priority — checked first)
+    ══════════════════════════════════════════════════════════════════════
+    If  report.turbulence.latest_flag == True  →  PAUSE DE SÉCURITÉ
+        • All price coordinates forced to 0.0
+        • inhibited = True,  signal_active = False
+        • No actuation data is returned to prevent manual override
+
+    ══════════════════════════════════════════════════════════════════════
+    ENTRY  —  Point d'Injection
+    ══════════════════════════════════════════════════════════════════════
+    Condition LONG:
+        %K[-2] < %D[-2]  AND  %K[-1] >= %D[-1]   (upward cross)
+        AND  %K[-1] < STOCH_EXHAUSTION_ZONE        (< 20, energy exhaustion)
+        AND  report.ou.theta > 0.15                (OU compression detected)
+
+    Condition SHORT:
+        %K[-2] > %D[-2]  AND  %K[-1] <= %D[-1]   (downward cross)
+        AND  %K[-1] > STOCH_OVERBOUGHT_ZONE        (> 80, overbought)
+        AND  report.ou.theta > 0.15
+
+    Entry price = close[-1]  (last confirmed candle close)
+
+    ══════════════════════════════════════════════════════════════════════
+    NDT  —  Seuil de Décompression Nominale  (Take Profit)
+    ══════════════════════════════════════════════════════════════════════
+    NDT_LONG  = entry  +  NDT_SIGMA_MULTIPLE × σ_ann × entry
+              = entry  ×  (1  +  2.5 × σ_GBM)
+
+    NDT_SHORT = entry  −  NDT_SIGMA_MULTIPLE × σ_ann × entry
+              = entry  ×  (1  −  2.5 × σ_GBM)
+
+    Physical meaning: price must travel 2.5 annualised standard deviations
+    in the direction of the trade before the decompression phase completes.
+
+    ══════════════════════════════════════════════════════════════════════
+    ERV  —  Soupape de Sécurité  (Stop Loss / Rupture irrévocable)
+    ══════════════════════════════════════════════════════════════════════
+    ERV_LONG  = entry  −  ERV_SIGMA_MULTIPLE × σ_ann × entry
+              = entry  ×  (1  −  1.5 × σ_GBM)
+
+    ERV_SHORT = entry  +  ERV_SIGMA_MULTIPLE × σ_ann × entry
+              = entry  ×  (1  +  1.5 × σ_GBM)
+
+    Positioned 1.5σ beyond the structural inflection point.
+    Irrévocable: once breached, no re-entry is permitted in same session.
+
+    ══════════════════════════════════════════════════════════════════════
+    HEP  —  Équilibre Hydrostatique  (Break Even)
+    ══════════════════════════════════════════════════════════════════════
+    HEP = entry  ×  (1  +  HEP_FRICTION_OFFSET)
+        = entry  ×  1.002
+
+    Neutral pressure point compensating for mechanical friction
+    (bid/ask spread + commission).  Direction-agnostic.
+
+    ══════════════════════════════════════════════════════════════════════
+    RISK/REWARD RATIO
+    ══════════════════════════════════════════════════════════════════════
+    R/R = |NDT − entry|  /  |ERV − entry|
+        = 2.5σ / 1.5σ  =  1.667  (theoretical constant when σ is stable)
+    """
+    ac = ActionCoordinates()
+
+    # ── Guard: insufficient data ──────────────────────────────────────────
+    if df.empty or len(df) < STOCH_K_PERIOD + STOCH_D_PERIOD + 2:
+        return ac
+    if not report.gbm.valid or not report.ou.valid:
+        return ac
+
+    # ── INHIBITION CHECK  (absolute priority) ─────────────────────────────
+    if report.turbulence.valid and report.turbulence.latest_flag:
+        ac.inhibited      = True
+        ac.inhibit_reason = "INSTABILITÉ TURBULENTE HORS-LIMITE"
+        ac.direction      = "INHIBITED"
+        ac.signal_active  = False
+        ac.stoch_k        = float(df["stoch_k"].iloc[-1]) if "stoch_k" in df.columns else 0.0
+        ac.stoch_d        = float(df["stoch_d"].iloc[-1]) if "stoch_d" in df.columns else 0.0
+        ac.ou_theta       = report.ou.theta
+        ac.sigma_ann      = report.gbm.sigma
+        # All actuation prices FORCED to zero — prevent manual override
+        ac.entry          = 0.0
+        ac.ndt            = 0.0
+        ac.erv            = 0.0
+        ac.hep            = 0.0
+        ac.rr_ratio       = 0.0
+        ac.valid          = True
+        return ac
+
+    # ── Extract stochastic values ─────────────────────────────────────────
+    if "stoch_k" not in df.columns or "stoch_d" not in df.columns:
+        return ac
+
+    stoch_k_series = df["stoch_k"].dropna()
+    stoch_d_series = df["stoch_d"].dropna()
+    if len(stoch_k_series) < 2 or len(stoch_d_series) < 2:
+        return ac
+
+    k_now:  float = float(stoch_k_series.iloc[-1])
+    d_now:  float = float(stoch_d_series.iloc[-1])
+    k_prev: float = float(stoch_k_series.iloc[-2])
+    d_prev: float = float(stoch_d_series.iloc[-2])
+
+    # ── Detect %K / %D crossover ──────────────────────────────────────────
+    cross_up:   bool = (k_prev < d_prev) and (k_now >= d_now)   # bullish cross
+    cross_down: bool = (k_prev > d_prev) and (k_now <= d_now)   # bearish cross
+
+    # ── OU compression condition ──────────────────────────────────────────
+    ou_compressing: bool = report.ou.theta > 0.15
+
+    # ── Entry signal evaluation ───────────────────────────────────────────
+    entry_price: float = float(df["close"].iloc[-1])
+    direction:   str   = "WAIT"
+    signal:      bool  = False
+
+    if cross_up and k_now < STOCH_EXHAUSTION_ZONE and ou_compressing:
+        direction = "LONG"
+        signal    = True
+    elif cross_down and k_now > STOCH_OVERBOUGHT_ZONE and ou_compressing:
+        direction = "SHORT"
+        signal    = True
+
+    # ── Retrieve annualised σ from GBM ────────────────────────────────────
+    sigma_ann: float = report.gbm.sigma       # annualised; > 0 guaranteed by valid check
+
+    # ── Compute coordinate thresholds ────────────────────────────────────
+    sigma_offset_ndt: float = NDT_SIGMA_MULTIPLE * sigma_ann * entry_price   # 2.5σ × S
+    sigma_offset_erv: float = ERV_SIGMA_MULTIPLE * sigma_ann * entry_price   # 1.5σ × S
+
+    if direction == "LONG":
+        ndt = entry_price + sigma_offset_ndt
+        erv = entry_price - sigma_offset_erv
+    elif direction == "SHORT":
+        ndt = entry_price - sigma_offset_ndt
+        erv = entry_price + sigma_offset_erv
+    else:
+        # No signal: coordinates computed relative to current price (for display)
+        ndt = entry_price + sigma_offset_ndt
+        erv = entry_price - sigma_offset_erv
+
+    hep: float = entry_price * (1.0 + HEP_FRICTION_OFFSET)
+
+    # ── Risk / Reward ratio ───────────────────────────────────────────────
+    denom_rr = abs(erv - entry_price)
+    rr_ratio: float = (
+        round(abs(ndt - entry_price) / denom_rr, 3)
+        if denom_rr > 1e-6 else 0.0
+    )
+
+    # ── Populate result ───────────────────────────────────────────────────
+    ac.entry         = round(entry_price,       3)
+    ac.ndt           = round(ndt,               3)
+    ac.erv           = round(erv,               3)
+    ac.hep           = round(hep,               3)
+    ac.direction     = direction
+    ac.stoch_k       = round(k_now,             3)
+    ac.stoch_d       = round(d_now,             3)
+    ac.k_crosses_d   = cross_up or cross_down
+    ac.ou_theta      = report.ou.theta
+    ac.sigma_ann     = sigma_ann
+    ac.inhibited     = False
+    ac.inhibit_reason= ""
+    ac.signal_active = signal
+    ac.rr_ratio      = rr_ratio
+    ac.valid         = True
+    return ac
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACTION COORDINATES UI RENDERER
+# ─────────────────────────────────────────────────────────────────────────────
+def render_action_coordinates(ac: ActionCoordinates) -> None:
+    """
+    Renders the full Action Coordinate panel inside the live fragment.
+
+    Layout
+    ──────
+    Row 1: Section header + signal badge + stochastic bar
+    Row 2: 4 × st.metric  (Entry | NDT | ERV | HEP)
+    Row 3: Detail cards   (direction, R/R, θ, σ, %K, %D)
+
+    If inhibited: replaces all content with PAUSE DE SÉCURITÉ overlay.
+    """
+    st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+
+    # ── INHIBITION STATE ─────────────────────────────────────────────────
+    if ac.inhibited:
         st.markdown(
-            f'<div class="action-panel {panel_css}">'
-            f'<div style="font-size:1.8rem;line-height:1;">{icon}</div>'
-            f'<div class="action-headline {headline_css}">{headline_text}</div>'
-            f'{detail_html}'
-            f'{proc_badge_html}'
+            f'<div class="inhibit-overlay">'
+            f'<div class="inhibit-title">⛔ PAUSE DE SÉCURITÉ — SYSTÈME VERROUILLÉ</div>'
+            f'<div class="inhibit-sub">'
+            f'MOTIF : {ac.inhibit_reason}<br>'
+            f'Toutes les coordonnées d\'actionnement ont été neutralisées.<br>'
+            f'Aucune intervention opérateur autorisée jusqu\'à stabilisation du flux.'
+            f'</div>'
+            f'<div class="inhibit-zero">'
+            f'ENTRY: 0.000  │  NDT: 0.000  │  ERV: 0.000  │  HEP: 0.000'
+            f'</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
-    else:
-        st.info(
-            f"Seuils d'intervention en attente — "
-            f"minimum {MIN_ROWS_FOR_STOCHASTICS} acquisitions requises "
-            f"(actuellement : {len(st.session_state['pressure_history_df'])})."
-        )
-
-    st.markdown('<div style="margin-top:16px;"></div>', unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  5 ST.METRIC PRÉÉMINENTS — Pression + 4 coordonnées d'actionnement
-    # ══════════════════════════════════════════════════════════════════════
-    st.markdown(
-        '<div class="metric-label" style="margin-bottom:8px;">'
-        'Coordonnées d\'actionnement — Panneau de commande central</div>',
-        unsafe_allow_html=True,
-    )
-
-    df_now = st.session_state["pressure_history_df"]
-
-    # Valeurs courantes
-    if pressure is not None and api_error is None:
-        p_disp     = pressure
-        delta_disp = float(df_now["delta_bar"].iloc[-1]) if len(df_now) > 0 else 0.0
-    elif len(df_now) > 0:
-        p_disp     = float(df_now["pressure_bar"].iloc[-1])
-        delta_disp = float(df_now["delta_bar"].iloc[-1])
-    else:
-        p_disp, delta_disp = None, None
-
-    # Résolution des 4 seuils (None si inhibé ou données insuffisantes)
-    zp_disp  = th["zeroing_point"] if (th and not th["inhibited"]) else None
-    ndt_disp = th["ndt"]           if (th and not th["inhibited"]) else None
-    erv_disp = th["erv"]           if (th and not th["inhibited"]) else None
-    hep_disp = th["hep"]           if (th and not th["inhibited"]) else None
-
-    # Delta vs cycle précédent (depuis historique)
-    def _prev_val(key_th: Optional[float]) -> Optional[float]:
-        """Retourne None — les deltas st.metric sont calculés vs valeur précédente."""
-        return None
-
-    col_p, col_zp, col_ndt, col_erv, col_hep = st.columns(5)
-
-    # ── PRESSION ACTUELLE ─────────────────────────────────────────────────
-    with col_p:
-        if p_disp is not None:
-            delta_str  = f"{delta_disp:+.3f} bar" if delta_disp is not None else None
-            p_status   = _classify_pressure_status(p_disp)
-            p_delta_c  = ("normal" if abs(delta_disp or 0) < 1.0
-                          else "off" if (delta_disp or 0) > 0 else "inverse")
-            st.metric(
-                label       = "PRESSION ACTUELLE",
-                value       = f"{p_disp:.3f} bar",
-                delta       = delta_str,
-                delta_color = p_delta_c,
-                help        = f"Statut zone : {p_status.upper()} | "
-                              f"Latence API : {latency_ms:.1f} ms",
-            )
-        else:
-            st.metric("PRESSION ACTUELLE", "— bar", help="Données indisponibles")
-
-    # ── PROCÉDURE D'INJECTION — Zeroing Point (Entry) ─────────────────────
-    with col_zp:
-        if zp_disp is not None:
-            zp_z = _classify_pressure_status(zp_disp)
-            st.metric(
-                label = "PROCÉDURE D'INJECTION (Entry)",
-                value = f"{zp_disp:.3f} bar",
-                delta = f"Proc. {th['procedure']}",
-                delta_color = "normal",
-                help  = (
-                    f"Zeroing Point — Point d'inversion cinétique.\n"
-                    f"Zone : {zp_z.upper()} | "
-                    f"Sens : {th['zeroing_direction'].upper()}"
-                ),
-            )
-        else:
-            lbl_inh = "INHIBÉ" if (th and th["inhibited"]) else "—"
-            st.metric("PROCÉDURE D'INJECTION (Entry)", lbl_inh,
-                      help="En attente de données suffisantes ou inhibition active")
-
-    # ── DÉCOMPRESSION NDT — Take Profit ───────────────────────────────────
-    with col_ndt:
-        if ndt_disp is not None:
-            ndt_z = _classify_pressure_status(ndt_disp)
-            ndt_d = ndt_disp - (zp_disp or ndt_disp)
-            st.metric(
-                label = "DÉCOMPRESSION NDT (Take Profit)",
-                value = f"{ndt_disp:.3f} bar",
-                delta = f"{ndt_d:+.3f} bar vs ZP",
-                delta_color = "normal" if ndt_d >= 0 else "inverse",
-                help  = (
-                    f"Nominal Decompression Threshold — Jauge de désengagement.\n"
-                    f"Zone : {ndt_z.upper()} | "
-                    f"Ratio Fibonacci : {NDT_VOLATILITY_RATIO}"
-                ),
-            )
-        else:
-            st.metric("DÉCOMPRESSION NDT (Take Profit)", "— bar")
-
-    # ── SOUPAPE URGENCE ERV — Stop Loss ───────────────────────────────────
-    with col_erv:
-        if erv_disp is not None:
-            erv_z = _classify_pressure_status(erv_disp)
-            erv_d = erv_disp - (p_disp or erv_disp)
-            st.metric(
-                label = "SOUPAPE URGENCE ERV (Stop Loss)",
-                value = f"{erv_disp:.3f} bar",
-                delta = f"{erv_d:+.3f} bar vs P",
-                delta_color = "off" if erv_z == "critical" else "normal",
-                help  = (
-                    f"Emergency Relief Valve — Barrière de coupure préventive.\n"
-                    f"Zone : {erv_z.upper()} | "
-                    f"Multiplicateur : {ERV_SAFETY_MULTIPLIER}×σ_turb"
-                ),
-            )
-        else:
-            st.metric("SOUPAPE URGENCE ERV (Stop Loss)", "— bar")
-
-    # ── ÉQUILIBRE HEP — Break Even ────────────────────────────────────────
-    with col_hep:
-        if hep_disp is not None:
-            hep_z = _classify_pressure_status(hep_disp)
-            hep_d = hep_disp - (zp_disp or hep_disp)
-            st.metric(
-                label = "ÉQUILIBRE HEP (Break Even)",
-                value = f"{hep_disp:.3f} bar",
-                delta = f"{hep_d:+.3f} bar vs ZP",
-                delta_color = "normal",
-                help  = (
-                    f"Hydrostatique Equilibrium Point — Cible post-intervention.\n"
-                    f"Zone : {hep_z.upper()} | "
-                    f"Offset friction : +{HEP_FRICTION_OFFSET_BAR} bar"
-                ),
-            )
-        else:
-            st.metric("ÉQUILIBRE HEP (Break Even)", "— bar")
-
-    st.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  GRAPHIQUE PRINCIPAL — Pression historique + niveaux intervention
-    # ══════════════════════════════════════════════════════════════════════
-    st.markdown(
-        '<div class="metric-label" style="margin-bottom:6px;">'
-        'Historique pression absolue — Niveaux intervention superposés</div>',
-        unsafe_allow_html=True,
-    )
-
-    try:
-        df_plot = st.session_state["pressure_history_df"]
-        fig_main = go.Figure()
-
-        if len(df_plot) > 0:
-            xv = df_plot["timestamp"].dt.strftime("%H:%M:%S").tolist()
-
-            fig_main.add_hrect(y0=PRESSURE_NOMINAL_MIN, y1=PRESSURE_NOMINAL_MAX,
-                               fillcolor="rgba(0,229,160,0.04)",
-                               line_width=0, layer="below")
-            fig_main.add_hrect(y0=PRESSURE_NOMINAL_MAX, y1=PRESSURE_WARNING_HIGH,
-                               fillcolor="rgba(255,184,48,0.04)",
-                               line_width=0, layer="below")
-            fig_main.add_hrect(y0=PRESSURE_WARNING_LOW, y1=PRESSURE_NOMINAL_MIN,
-                               fillcolor="rgba(255,184,48,0.04)",
-                               line_width=0, layer="below")
-
-            fig_main.add_trace(go.Scatter(
-                x=xv, y=df_plot["pressure_bar"].tolist(),
-                mode="lines", name="P absolue",
-                line=dict(color=COLOR_ACCENT, width=2.0),
-                fill="tozeroy", fillcolor="rgba(58,123,255,0.05)",
-            ))
-            fig_main.add_trace(go.Scatter(
-                x=xv, y=df_plot["rolling_avg_5"].tolist(),
-                mode="lines", name="Moy.5",
-                line=dict(color=COLOR_NOMINAL, width=1.2, dash="dot"),
-            ))
-
-            # Lignes de seuil de sécurité
-            for y_v, col, lbl in [
-                (PRESSURE_WARNING_HIGH,  COLOR_WARNING,  "Alerte ↑"),
-                (PRESSURE_WARNING_LOW,   COLOR_WARNING,  "Alerte ↓"),
-                (PRESSURE_CRITICAL_HIGH, COLOR_CRITICAL, "Critique ↑"),
-                (PRESSURE_CRITICAL_LOW,  COLOR_CRITICAL, "Critique ↓"),
-            ]:
-                fig_main.add_hline(y=y_v, line_color=col, line_dash="dash",
-                                   line_width=0.8,
-                                   annotation_text=f" {lbl} {y_v}",
-                                   annotation_font_color=col,
-                                   annotation_font_size=9)
-
-            # Superposition des 4 niveaux d'intervention
-            if th and not th["inhibited"]:
-                for attr, col, lbl, dash in [
-                    ("zeroing_point", COLOR_ZP,  "ZP",  "dot"),
-                    ("ndt",           COLOR_NDT, "NDT", "dashdot"),
-                    ("erv",           COLOR_ERV, "ERV", "dash"),
-                    ("hep",           COLOR_HEP, "HEP", "longdash"),
-                ]:
-                    v = th.get(attr)
-                    if v is not None:
-                        fig_main.add_hline(
-                            y=v, line_color=col, line_dash=dash, line_width=1.1,
-                            annotation_text=f" {lbl} {v:.3f}",
-                            annotation_font_color=col, annotation_font_size=9,
-                        )
-            elif th and th["inhibited"]:
-                # Ligne rouge d'inhibition
-                fig_main.add_hline(
-                    y=TURBULENCE_INHIBIT_THRESHOLD * 10,  # symbolique hors axe
-                    line_color=COLOR_INHIBIT, line_dash="dash", line_width=0,
-                )
-                fig_main.add_annotation(
-                    text="⛔ INHIBITION ACTIVE",
-                    xref="paper", yref="paper", x=0.5, y=0.95,
-                    showarrow=False,
-                    font=dict(color=COLOR_INHIBIT, size=13,
-                              family="Barlow Condensed"),
-                    bgcolor="rgba(255,0,85,0.12)",
-                    bordercolor=COLOR_INHIBIT, borderwidth=1,
-                )
-
-        fig_main.update_layout(
-            paper_bgcolor=COLOR_PANEL, plot_bgcolor=COLOR_PANEL,
-            font=dict(family="Share Tech Mono, monospace",
-                      color=COLOR_TEXT_MUT, size=10),
-            margin=dict(l=10, r=10, t=30, b=10), height=290,
-            showlegend=True,
-            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=10),
-                        orientation="h", y=1.08),
-            xaxis=dict(gridcolor=COLOR_BORDER, showgrid=True, zeroline=False,
-                       title="Horodatage (UTC)", tickfont=dict(size=9)),
-            yaxis=dict(gridcolor=COLOR_BORDER, showgrid=True, zeroline=False,
-                       title=f"Pression ({PRESSURE_UNIT})"),
-        )
-        st.plotly_chart(fig_main, use_container_width=True)
-
-    except Exception as exc_plot:
-        st.error(f"Graphique temporairement indisponible : {exc_plot}")
-
-    st.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  RANGÉE KPI STOCHASTIQUE  (fragment — mise à jour toutes les 5 s)
-    # ══════════════════════════════════════════════════════════════════════
-    st.markdown(
-        '<div class="section-header">'
-        'Moteur Stochastique — Cinématique Fluide XA-UUSD'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    try:
-        sr_live = st.session_state.get("stoch_results")
+        # Metric row with zeroed values
         c1, c2, c3, c4 = st.columns(4)
+        c1.metric("⛔ ENTRY  [LOCKED]", "0.000")
+        c2.metric("⛔ NDT    [LOCKED]", "0.000")
+        c3.metric("⛔ ERV    [LOCKED]", "0.000")
+        c4.metric("⛔ HEP    [LOCKED]", "0.000")
+        st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+        return
 
-        with c1:
-            if sr_live and not math.isnan(sr_live["turbulence_last"]):
-                t_v = sr_live["turbulence_last"]
-                t_c = (COLOR_INHIBIT if t_v > TURBULENCE_INHIBIT_THRESHOLD
-                       else COLOR_CRITICAL if t_v > 2.0
-                       else COLOR_WARNING  if t_v > 0.8
-                       else COLOR_NOMINAL)
-                sub = ("⛔ CHAOS" if t_v > TURBULENCE_INHIBIT_THRESHOLD
-                       else "ÉLEVÉE" if t_v > 0.8 else "FAIBLE")
-                t_s = f"{t_v:.4f}"
-            else:
-                t_s, t_c, sub = "—", COLOR_TEXT_MUT, "EN ATTENTE"
+    if not ac.valid:
+        st.info("⏳ Action Coordinate Engine — accumulating data…")
+        return
+
+    # ── SECTION HEADER ────────────────────────────────────────────────────
+    hcol1, hcol2, hcol3 = st.columns([2, 1, 1])
+    with hcol1:
+        st.markdown(
+            '<div class="ac-title">⬡ COORDONNÉES D\'ACTIONNEMENT  —  INGÉNIEUR DE GARDE</div>',
+            unsafe_allow_html=True,
+        )
+    with hcol2:
+        sig_css = {
+            "LONG":  "signal-long",
+            "SHORT": "signal-short",
+            "WAIT":  "signal-wait",
+        }.get(ac.direction, "signal-wait")
+        sig_icon = {"LONG": "▲ LONG", "SHORT": "▼ SHORT", "WAIT": "◌ ATTENTE"}.get(
+            ac.direction, "◌ ATTENTE"
+        )
+        active_str = "● ACTIF" if ac.signal_active else "○ VEILLE"
+        st.markdown(
+            f'<div style="text-align:center; padding-top:4px;">'
+            f'<span class="{sig_css}">{sig_icon}</span><br>'
+            f'<span style="font-size:0.62rem; color:#00CC33;">{active_str}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with hcol3:
+        rr_color = COLOR_UP if ac.rr_ratio >= 1.5 else COLOR_AMBER
+        st.markdown(
+            f'<div style="text-align:center; padding-top:4px;">'
+            f'<span style="font-family:{FONT_MONO}; font-size:0.68rem; color:#00CC33;">R/R RATIO</span><br>'
+            f'<span style="font-family:{FONT_MONO}; font-size:1.3rem; color:{rr_color}; '
+            f'text-shadow:0 0 8px {rr_color};">{ac.rr_ratio:.3f}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Stochastic oscillator visual bar ──────────────────────────────────
+    k_pct = min(max(ac.stoch_k, 0.0), 100.0)
+    if k_pct < 20:
+        bar_color = COLOR_UP
+    elif k_pct > 80:
+        bar_color = COLOR_DOWN
+    else:
+        bar_color = COLOR_AMBER
+    st.markdown(
+        f'<div style="font-family:{FONT_MONO}; font-size:0.65rem; color:#00CC33; margin-top:4px;">'
+        f'STOCHASTIC OSCILLATOR  %K={ac.stoch_k:.1f}  %D={ac.stoch_d:.1f}'
+        f'{"  ⚡ CROSSOVER DÉTECTÉ" if ac.k_crosses_d else ""}'
+        f'</div>'
+        f'<div class="stoch-bar-outer">'
+        f'<div class="stoch-bar-inner" style="width:{k_pct:.1f}%; '
+        f'background:linear-gradient(90deg,{bar_color}66,{bar_color});"></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── 4-column metric row ───────────────────────────────────────────────
+    m_entry, m_ndt, m_erv, m_hep = st.columns(4)
+
+    entry_delta = (
+        f"θ={ac.ou_theta:.4f} · σ={ac.sigma_ann:.4f}"
+        if ac.ou_theta > 0 else None
+    )
+
+    m_entry.metric(
+        label = "▸ ENTRY  [INJECTION]",
+        value = f"{ac.entry:,.3f}" if ac.entry != 0 else "—",
+        delta = entry_delta,
+    )
+    m_ndt.metric(
+        label = "▸ NDT  [TAKE PROFIT]",
+        value = f"{ac.ndt:,.3f}" if ac.ndt != 0 else "—",
+        delta = f"+{NDT_SIGMA_MULTIPLE}σ × S" if ac.direction == "LONG"
+                else f"−{NDT_SIGMA_MULTIPLE}σ × S",
+    )
+    m_erv.metric(
+        label = "▸ ERV  [STOP LOSS]",
+        value = f"{ac.erv:,.3f}" if ac.erv != 0 else "—",
+        delta = f"−{ERV_SIGMA_MULTIPLE}σ × S" if ac.direction == "LONG"
+                else f"+{ERV_SIGMA_MULTIPLE}σ × S",
+    )
+    m_hep.metric(
+        label = "▸ HEP  [BREAK EVEN]",
+        value = f"{ac.hep:,.3f}" if ac.hep != 0 else "—",
+        delta = f"+{HEP_FRICTION_OFFSET*100:.1f}% friction offset",
+    )
+
+    # ── Detail cards row ──────────────────────────────────────────────────
+    st.markdown('<div class="ac-panel">', unsafe_allow_html=True)
+    st.markdown('<div class="ac-title">▸ PARAMÈTRES DE CALCUL</div>', unsafe_allow_html=True)
+
+    dc1, dc2, dc3, dc4, dc5, dc6 = st.columns(6)
+
+    dir_color = {
+        "LONG":  COLOR_UP,
+        "SHORT": COLOR_DOWN,
+        "WAIT":  COLOR_AMBER,
+    }.get(ac.direction, COLOR_AMBER)
+    dc1.metric("DIRECTION",     ac.direction)
+    dc2.metric("SIGNAL",        "ACTIF" if ac.signal_active else "VEILLE")
+    dc3.metric("%K STOCH",      f"{ac.stoch_k:.2f}")
+    dc4.metric("%D STOCH",      f"{ac.stoch_d:.2f}")
+    dc5.metric("θ OU SPEED",    f"{ac.ou_theta:.5f}")
+    dc6.metric("σ GBM (ann.)",  f"{ac.sigma_ann:.5f}")
+
+    # ── Coordinate detail cards ───────────────────────────────────────────
+    dist_ndt = abs(ac.ndt - ac.entry)
+    dist_erv = abs(ac.erv - ac.entry)
+    dist_hep = abs(ac.hep - ac.entry)
+
+    st.markdown(
+        f'<div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">'
+
+        f'<div class="coord-card entry" style="flex:1; min-width:140px;">'
+        f'<div class="coord-label entry">ENTRY  —  INJECTION</div>'
+        f'<div class="coord-value entry">{ac.entry:,.3f}</div>'
+        f'<div class="coord-sub">%K={ac.stoch_k:.1f} · θ={ac.ou_theta:.4f}</div>'
+        f'</div>'
+
+        f'<div class="coord-card ndt" style="flex:1; min-width:140px;">'
+        f'<div class="coord-label ndt">NDT  —  DÉCOMPRESSION</div>'
+        f'<div class="coord-value ndt">{ac.ndt:,.3f}</div>'
+        f'<div class="coord-sub">Δ={dist_ndt:,.3f}  ({NDT_SIGMA_MULTIPLE}σ×S)</div>'
+        f'</div>'
+
+        f'<div class="coord-card erv" style="flex:1; min-width:140px;">'
+        f'<div class="coord-label erv">ERV  —  SOUPAPE</div>'
+        f'<div class="coord-value erv">{ac.erv:,.3f}</div>'
+        f'<div class="coord-sub">Δ={dist_erv:,.3f}  ({ERV_SIGMA_MULTIPLE}σ×S)</div>'
+        f'</div>'
+
+        f'<div class="coord-card hep" style="flex:1; min-width:140px;">'
+        f'<div class="coord-label hep">HEP  —  ÉQUILIBRE</div>'
+        f'<div class="coord-value hep">{ac.hep:,.3f}</div>'
+        f'<div class="coord-sub">Δ={dist_hep:,.3f}  (+{HEP_FRICTION_OFFSET*100:.1f}%)</div>'
+        f'</div>'
+
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+
+
+def build_stochastic_chart(df: pd.DataFrame, ac: ActionCoordinates) -> go.Figure:
+    """
+    Stochastic oscillator chart with:
+    • %K line (white/green)
+    • %D line (amber)
+    • Overbought (80) / Oversold (20) / Midline (50) bands
+    • Entry crossover marker if signal_active
+    """
+    fig = go.Figure()
+    if "stoch_k" not in df.columns or df.empty:
+        return fig
+
+    tail  = df.tail(80)
+    ts    = tail["timestamp"]
+    k_val = tail["stoch_k"].fillna(50)
+    d_val = tail["stoch_d"].fillna(50)
+
+    # Filled zone between %K and %D
+    fig.add_trace(go.Scatter(
+        x=ts, y=k_val, name="%K",
+        line=dict(color=COLOR_UP, width=1.4),
+        fill=None,
+    ))
+    fig.add_trace(go.Scatter(
+        x=ts, y=d_val, name="%D",
+        line=dict(color=COLOR_AMBER, width=1.2, dash="dot"),
+        fill="tonexty",
+        fillcolor="rgba(0,255,65,0.04)",
+    ))
+
+    # Threshold bands
+    for lvl, col, lbl in [
+        (STOCH_OVERBOUGHT_ZONE, "rgba(255,60,60,0.3)",  "OB 80"),
+        (50.0,                  "rgba(255,255,255,0.1)", "MID 50"),
+        (STOCH_EXHAUSTION_ZONE, "rgba(0,255,65,0.3)",   "OS 20"),
+    ]:
+        fig.add_hline(y=lvl, line_dash="dot", line_color=col,
+                      annotation_text=lbl,
+                      annotation_font=dict(family=FONT_MONO, size=8,
+                                           color=col.replace("0.3)", "0.9)")))
+
+    # Crossover entry marker
+    if ac.signal_active and ac.valid and not ac.inhibited:
+        last_ts = tail["timestamp"].iloc[-1]
+        last_k  = float(k_val.iloc[-1])
+        marker_color = COLOR_UP if ac.direction == "LONG" else COLOR_DOWN
+        marker_sym   = "triangle-up" if ac.direction == "LONG" else "triangle-down"
+        fig.add_trace(go.Scatter(
+            x=[last_ts], y=[last_k],
+            mode="markers", name=f"⚡ {ac.direction}",
+            marker=dict(color=marker_color, size=14, symbol=marker_sym,
+                        line=dict(color=marker_color, width=1.5)),
+        ))
+
+    fig.update_layout(
+        **_BASE, height=160,
+        title=dict(
+            text=(f"STOCHASTIC  %K({STOCH_K_PERIOD}) · %D({STOCH_D_PERIOD})"
+                  f"  │  %K={ac.stoch_k:.1f}  │  %D={ac.stoch_d:.1f}"
+                  f"  │  {'⚡ CROSSOVER' if ac.k_crosses_d else 'NO CROSS'}"),
+            font=dict(family=FONT_MONO, size=10, color=COLOR_UP),
+        ),
+        yaxis=dict(range=[0, 100], side="right",
+                   tickfont=dict(size=8), showgrid=True, gridcolor=COLOR_GRID),
+        margin=dict(l=4, r=4, t=30, b=4),
+        showlegend=True,
+        legend=dict(font=dict(family=FONT_MONO, size=8),
+                    bgcolor="rgba(0,0,0,0.6)"),
+    )
+    return fig
+
+
+def build_coord_chart(df: pd.DataFrame, ac: ActionCoordinates) -> go.Figure:
+    """
+    Price chart overlaying the four action coordinate levels as horizontal lines.
+    Shows last 40 candles of the 1M feed with ENTRY / NDT / ERV / HEP annotations.
+    """
+    fig = go.Figure()
+    if df.empty or not ac.valid or ac.inhibited:
+        return fig
+
+    tail = df.tail(40)
+    ts   = tail["timestamp"]
+
+    fig.add_trace(go.Candlestick(
+        x=tail["timestamp"],
+        open=tail["open"], high=tail["high"],
+        low=tail["low"],   close=tail["close"],
+        name="PRICE",
+        increasing=dict(line=dict(color=COLOR_UP,   width=1), fillcolor=COLOR_UP),
+        decreasing=dict(line=dict(color=COLOR_DOWN, width=1), fillcolor=COLOR_DOWN),
+        whiskerwidth=0.4,
+    ))
+
+    # Coordinate lines
+    levels = [
+        (ac.ndt,   COLOR_CYAN,   "NDT",   "solid"),
+        (ac.entry, COLOR_UP,     "ENTRY", "solid"),
+        (ac.hep,   COLOR_AMBER,  "HEP",   "dash"),
+        (ac.erv,   COLOR_DOWN,   "ERV",   "dot"),
+    ]
+    for price, color, label, dash in levels:
+        if price > 0:
+            fig.add_hline(
+                y=price,
+                line_color=color,
+                line_dash=dash,
+                line_width=1.5,
+                annotation_text=f"{label}  {price:,.3f}",
+                annotation_position="right",
+                annotation_font=dict(family=FONT_MONO, size=9, color=color),
+            )
+
+    dir_color = {"LONG": COLOR_UP, "SHORT": COLOR_DOWN, "WAIT": COLOR_AMBER}.get(
+        ac.direction, COLOR_AMBER
+    )
+    fig.update_layout(
+        **_BASE, height=280,
+        title=dict(
+            text=(f"COORDINATE MAP  │  {ac.direction}"
+                  f"  │  R/R={ac.rr_ratio:.3f}"
+                  f"  │  {'⚡ SIGNAL ACTIF' if ac.signal_active else 'VEILLE'}"),
+            font=dict(family=FONT_MONO, size=10, color=dir_color),
+        ),
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=4, r=4, t=32, b=4),
+        showlegend=False,
+    )
+    fig.update_yaxes(side="right", tickfont=dict(size=8),
+                     showgrid=True, gridcolor=COLOR_GRID)
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHART BUILDERS  (pre-existing — see below)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_main_chart(df: pd.DataFrame, title: str = "XA·UUSD  KINETIC PRESSURE") -> go.Figure:
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True,
+        row_heights=[0.55, 0.15, 0.15, 0.15],
+        vertical_spacing=0.015,
+    )
+    ts = df["timestamp"]
+    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+
+    fig.add_trace(go.Candlestick(
+        x=ts, open=o, high=h, low=l, close=c, name="KLINE",
+        increasing=dict(line=dict(color=COLOR_UP,   width=1), fillcolor=COLOR_UP),
+        decreasing=dict(line=dict(color=COLOR_DOWN, width=1), fillcolor=COLOR_DOWN),
+        whiskerwidth=0.3,
+    ), row=1, col=1)
+
+    if "bb_up" in df.columns:
+        fig.add_trace(go.Scatter(x=ts, y=df["bb_up"], name="BB+2σ",
+            line=dict(color="rgba(0,229,255,0.35)", width=1, dash="dot")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ts, y=df["bb_mid"], name="BB mid",
+            line=dict(color="rgba(0,229,255,0.20)", width=1, dash="dash")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ts, y=df["bb_low"], name="BB−2σ",
+            line=dict(color="rgba(0,229,255,0.35)", width=1, dash="dot"),
+            fill="tonexty", fillcolor="rgba(0,229,255,0.03)"), row=1, col=1)
+
+    for col_n, col_c, lbl in [
+        ("ema9",  "#FFB300",              "EMA9"),
+        ("ema21", "rgba(255,60,60,0.7)",  "EMA21"),
+        ("ema50", "rgba(0,255,65,0.5)",   "EMA50"),
+    ]:
+        if col_n in df.columns:
+            fig.add_trace(go.Scatter(x=ts, y=df[col_n], name=lbl,
+                line=dict(color=col_c, width=1)), row=1, col=1)
+
+    vcol = [COLOR_VOLUME_UP if u else COLOR_VOLUME_DOWN for u in df["up_candle"]]
+    fig.add_trace(go.Bar(x=ts, y=df["volume"], name="VOL",
+        marker_color=vcol, showlegend=False), row=2, col=1)
+
+    if "rsi14" in df.columns:
+        fig.add_trace(go.Scatter(x=ts, y=df["rsi14"], name="RSI14",
+            line=dict(color="#FFB300", width=1.2), showlegend=False), row=3, col=1)
+        for lvl in [70, 30]:
+            fig.add_hline(y=lvl, line_dash="dot",
+                          line_color="rgba(255,255,255,0.15)", row=3, col=1)
+
+    if "macd" in df.columns:
+        hc = [COLOR_UP if v >= 0 else COLOR_DOWN for v in df["macd_hist"].fillna(0)]
+        fig.add_trace(go.Bar(x=ts, y=df["macd_hist"], name="HIST",
+            marker_color=hc, showlegend=False), row=4, col=1)
+        fig.add_trace(go.Scatter(x=ts, y=df["macd"], name="MACD",
+            line=dict(color="#00E5FF", width=1.2), showlegend=False), row=4, col=1)
+        fig.add_trace(go.Scatter(x=ts, y=df["macd_signal"], name="SIG",
+            line=dict(color="#FFB300", width=1.2), showlegend=False), row=4, col=1)
+
+    lay = {**_BASE}
+    lay["title"] = dict(text=title,
+                        font=dict(family=FONT_MONO, size=12, color=COLOR_UP),
+                        x=0.01, y=0.99)
+    lay["height"] = 640
+    lay["xaxis_rangeslider_visible"] = False
+    for i in range(1, 5):
+        ak = "yaxis" if i == 1 else f"yaxis{i}"
+        lay[ak] = dict(showgrid=True, gridcolor=COLOR_GRID, gridwidth=1,
+                       color=COLOR_AXIS, tickfont=dict(family=FONT_MONO, size=9),
+                       zeroline=False, side="right")
+    fig.update_layout(**lay)
+    fig.update_xaxes(showgrid=True, gridcolor=COLOR_GRID, color=COLOR_AXIS)
+    return fig
+
+
+def build_depth_gauge(last: float, prev: float, high: float, low: float) -> go.Figure:
+    rng   = high - low
+    pct   = round(((last - low) / rng) * 100, 1) if rng > 0 else 0.0
+    color = COLOR_UP if last >= prev else COLOR_DOWN
+    fig   = go.Figure(go.Indicator(
+        mode  = "gauge+number+delta",
+        value = last,
+        delta = dict(reference=prev, valueformat=".2f",
+                     increasing=dict(color=COLOR_UP),
+                     decreasing=dict(color=COLOR_DOWN)),
+        number= dict(font=dict(family=FONT_MONO, size=22, color=color),
+                     valueformat=".2f", suffix=" USD"),
+        gauge = dict(
+            axis=dict(range=[low * 0.998, high * 1.002], tickwidth=1,
+                      tickcolor=COLOR_AXIS, tickfont=dict(family=FONT_MONO, size=8)),
+            bar        = dict(color=color, thickness=0.25),
+            bgcolor    = COLOR_BG, borderwidth=1,
+            bordercolor= "rgba(0,255,65,0.3)",
+            steps=[
+                dict(range=[low * 0.998,      low + rng * 0.33], color="rgba(255,60,60,0.08)"),
+                dict(range=[low + rng * 0.33, low + rng * 0.66], color="rgba(255,179,0,0.06)"),
+                dict(range=[low + rng * 0.66, high * 1.002],     color="rgba(0,255,65,0.08)"),
+            ],
+            threshold=dict(line=dict(color=color, width=3), thickness=0.8, value=last),
+        ),
+        title=dict(
+            text=f"PRESSURE INDEX<br><span style='font-size:0.7em'>%POS: {pct}%</span>",
+            font=dict(family=FONT_MONO, size=11, color=COLOR_UP),
+        ),
+    ))
+    fig.update_layout(paper_bgcolor=COLOR_BG, plot_bgcolor=COLOR_BG,
+                      font=dict(family=FONT_MONO, color=COLOR_UP),
+                      height=260, margin=dict(l=12, r=12, t=36, b=12))
+    return fig
+
+
+def build_rsi_spark(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if "rsi14" not in df.columns or df.empty:
+        return fig
+    rsi = df["rsi14"].dropna().tail(60)
+    ts  = df.loc[rsi.index, "timestamp"]
+    fig.add_trace(go.Scatter(x=ts, y=rsi, mode="lines",
+        line=dict(color="#FFB300", width=1.5),
+        fill="tozeroy", fillcolor="rgba(255,179,0,0.06)", name="RSI14"))
+    for lvl in [70, 50, 30]:
+        fig.add_hline(y=lvl, line_dash="dot",
+                      line_color="rgba(255,255,255,0.15)")
+    fig.update_layout(**_BASE, height=140,
+        title=dict(text="RSI·14", font=dict(size=10, family=FONT_MONO)),
+        yaxis=dict(range=[0, 100], side="right",
+                   tickfont=dict(size=8), showgrid=True, gridcolor=COLOR_GRID),
+        margin=dict(l=4, r=4, t=22, b=4), showlegend=False)
+    return fig
+
+
+def build_volatility_heatmap(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if "atr14" not in df.columns or df.empty:
+        return fig
+    tail = df.tail(30)
+    atr  = tail["atr14"].fillna(0).values
+    ts   = tail["timestamp"].values
+    fig.add_trace(go.Bar(x=ts, y=atr, name="ATR14",
+        marker=dict(color=atr,
+                    colorscale=[[0.0, "rgba(0,255,65,0.2)"],
+                                [0.5, "rgba(255,179,0,0.5)"],
+                                [1.0, "rgba(255,60,60,0.8)"]],
+                    showscale=False)))
+    fig.update_layout(**_BASE, height=130,
+        title=dict(text="VOLATILITY FLUX  (ATR·14)", font=dict(size=10, family=FONT_MONO)),
+        yaxis=dict(side="right", tickfont=dict(size=8),
+                   showgrid=True, gridcolor=COLOR_GRID),
+        margin=dict(l=4, r=4, t=22, b=4), showlegend=False)
+    return fig
+
+
+def build_gbm_sigma_chart(df: pd.DataFrame, gbm: GBMResult) -> go.Figure:
+    """
+    Dual-axis chart:
+      Primary Y   — rolling annualised volatility σ_rolling(t)  [cyan fill]
+      Secondary Y — log-returns r_t  [green/red bars]
+    Title annotates global μ_ann and σ_ann from GBM fit.
+    """
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if not gbm.valid or df.empty:
+        return fig
+
+    ts_all  = df["timestamp"].values
+    n_wins  = len(gbm.sigma_rolling)
+    n_ret   = len(gbm.log_returns)
+
+    # sigma_rolling[i] aligns to the window ending at price index (GBM_WINDOW + i)
+    win_end_idx = np.clip(np.arange(GBM_WINDOW, GBM_WINDOW + n_wins), 0, len(ts_all) - 1)
+    ts_sigma    = ts_all[win_end_idx]
+
+    # log-returns align to price indices [1 .. n_ret]
+    ts_ret = ts_all[1: 1 + n_ret]
+
+    fig.add_trace(go.Scatter(
+        x=ts_sigma, y=gbm.sigma_rolling,
+        name="σ rolling (ann.)",
+        line=dict(color=COLOR_CYAN, width=1.5),
+        fill="tozeroy", fillcolor="rgba(0,229,255,0.06)",
+    ), secondary_y=False)
+
+    ret_colors = [COLOR_UP if r >= 0 else COLOR_DOWN for r in gbm.log_returns]
+    fig.add_trace(go.Bar(
+        x=ts_ret, y=gbm.log_returns,
+        name="r_t  log-return",
+        marker_color=ret_colors, opacity=0.55,
+    ), secondary_y=True)
+
+    fig.update_layout(
+        **_BASE, height=210,
+        title=dict(
+            text=(f"GBM KINETICS  │  μ(ann)={gbm.mu:+.6f}"
+                  f"  │  σ(ann)={gbm.sigma:.6f}"
+                  f"  │  window={GBM_WINDOW} cycles"),
+            font=dict(family=FONT_MONO, size=10, color=COLOR_CYAN),
+        ),
+        margin=dict(l=4, r=4, t=32, b=4),
+        showlegend=True,
+        legend=dict(font=dict(family=FONT_MONO, size=8),
+                    bgcolor="rgba(0,0,0,0.6)", x=0.01, y=0.99),
+    )
+    fig.update_yaxes(title_text="σ ann.", showgrid=True, gridcolor=COLOR_GRID,
+                     color=COLOR_CYAN, tickfont=dict(family=FONT_MONO, size=8),
+                     secondary_y=False)
+    fig.update_yaxes(title_text="r_t", showgrid=False,
+                     color=COLOR_UP, tickfont=dict(family=FONT_MONO, size=8),
+                     secondary_y=True)
+    return fig
+
+
+def build_ou_chart(df: pd.DataFrame, ou: OUResult) -> go.Figure:
+    """
+    Four traces:
+      1. S_t  actual close price        [green line]
+      2. X̄_t  OU deterministic path     [purple dotted]
+      3. μ_eq equilibrium horizontal    [amber dashed hline]
+      4. ε_t  residuals                 [green/red bars, secondary Y]
+    Title shows θ, μ_eq, T½, and current regime.
+    """
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if not ou.valid or df.empty:
+        return fig
+
+    n_path  = len(ou.ou_path)
+    ts      = df["timestamp"].values
+    ts_path = ts[:n_path]
+
+    fig.add_trace(go.Scatter(
+        x=ts_path, y=df["close"].values[:n_path],
+        name="S_t (actual)", line=dict(color=COLOR_UP, width=1.2),
+    ), secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=ts_path, y=ou.ou_path,
+        name="X̄_t  (OU path)", line=dict(color=COLOR_PURPLE, width=1.2, dash="dot"),
+    ), secondary_y=False)
+
+    fig.add_hline(
+        y=ou.mu_eq, line_dash="dash", line_color="rgba(255,179,0,0.5)",
+        annotation_text=f"μ_eq = {ou.mu_eq:.3f}",
+        annotation_font=dict(family=FONT_MONO, size=8, color=COLOR_AMBER),
+    )
+
+    n_res   = len(ou.residuals)
+    ts_res  = ts[:n_res]
+    res_col = ["rgba(0,255,65,0.5)" if r >= 0 else "rgba(255,60,60,0.5)"
+               for r in ou.residuals]
+    fig.add_trace(go.Bar(
+        x=ts_res, y=ou.residuals,
+        name="ε_t residuals", marker_color=res_col, opacity=0.5,
+    ), secondary_y=True)
+
+    regime_color = {"EXPLOSIVE_COMPRESSION": COLOR_DOWN,
+                    "RETURN_TO_REST":        COLOR_UP,
+                    "NEUTRAL":               COLOR_AMBER}.get(ou.regime, COLOR_AMBER)
+
+    fig.update_layout(
+        **_BASE, height=230,
+        title=dict(
+            text=(f"OU RELAXATION  │  θ={ou.theta:.6f}"
+                  f"  │  μ_eq={ou.mu_eq:.3f}"
+                  f"  │  T½={ou.half_life:.2f} p"
+                  f"  │  σ_ou={ou.sigma_ou:.6f}"
+                  f"  │  <span style='color:{regime_color}'>{ou.regime}</span>"),
+            font=dict(family=FONT_MONO, size=10, color=COLOR_PURPLE),
+        ),
+        margin=dict(l=4, r=4, t=34, b=4),
+        showlegend=True,
+        legend=dict(font=dict(family=FONT_MONO, size=8),
+                    bgcolor="rgba(0,0,0,0.6)", x=0.01, y=0.99),
+    )
+    fig.update_yaxes(title_text="Price", showgrid=True, gridcolor=COLOR_GRID,
+                     color=COLOR_UP, tickfont=dict(family=FONT_MONO, size=8),
+                     secondary_y=False)
+    fig.update_yaxes(title_text="ε_t", showgrid=False,
+                     color=COLOR_PURPLE, tickfont=dict(family=FONT_MONO, size=8),
+                     secondary_y=True)
+    return fig
+
+
+def build_turbulence_chart(df: pd.DataFrame, turb: TurbulenceResult) -> go.Figure:
+    """
+    Z-score of second-derivative acceleration Δ²P(t).
+    Threshold bands at ±2.5σ.
+    Anomaly cycles flagged with red × markers.
+    Title shows live turbulence status.
+    """
+    fig = go.Figure()
+    if not turb.valid or df.empty:
+        return fig
+
+    n_a  = len(turb.accel_zscore)
+    ts   = df["timestamp"].values
+    ts_a = ts[2: 2 + n_a]   # Δ² starts at index 2
+
+    fig.add_trace(go.Scatter(
+        x=ts_a, y=turb.accel_zscore,
+        name="Δ²P  z-score",
+        line=dict(color=COLOR_AMBER, width=1.2),
+        fill="tozeroy", fillcolor="rgba(255,179,0,0.04)",
+    ))
+
+    for lvl in [TURB_ACCEL_STD_THRESH, -TURB_ACCEL_STD_THRESH]:
+        fig.add_hline(
+            y=lvl, line_dash="dot", line_color="rgba(255,60,60,0.55)",
+            annotation_text=f"±{TURB_ACCEL_STD_THRESH}σ",
+            annotation_font=dict(family=FONT_MONO, size=8, color=COLOR_DOWN),
+        )
+
+    anom_idx = np.where(turb.anomaly_mask)[0]
+    if len(anom_idx) > 0:
+        fig.add_trace(go.Scatter(
+            x=ts_a[anom_idx], y=turb.accel_zscore[anom_idx],
+            mode="markers", name="⚠ TURBULENCE",
+            marker=dict(color=COLOR_DOWN, size=9, symbol="x",
+                        line=dict(color=COLOR_DOWN, width=1.5)),
+        ))
+
+    status_text = (
+        "⚠  INSTABILITÉ TURBULENTE DÉTECTÉE"
+        if turb.latest_flag else "✓  FLUX NOMINAL"
+    )
+    fig.update_layout(
+        **_BASE, height=170,
+        title=dict(
+            text=(f"TURBULENCE FILTER  │  Δ²P z-score"
+                  f"  │  anomalies: {turb.anomaly_count}"
+                  f"  │  {status_text}"),
+            font=dict(family=FONT_MONO, size=10,
+                      color=COLOR_DOWN if turb.latest_flag else COLOR_UP),
+        ),
+        yaxis=dict(side="right", tickfont=dict(size=8),
+                   showgrid=True, gridcolor=COLOR_GRID,
+                   zeroline=True, zerolinecolor="rgba(255,255,255,0.1)"),
+        margin=dict(l=4, r=4, t=32, b=4),
+        showlegend=True,
+        legend=dict(font=dict(family=FONT_MONO, size=8),
+                    bgcolor="rgba(0,0,0,0.6)"),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYTICS SUMMARY PANEL
+# ─────────────────────────────────────────────────────────────────────────────
+def render_analytics_panel(report: FluidKineticsReport) -> None:
+    st.markdown('<div class="q-divider-cyan"></div>', unsafe_allow_html=True)
+
+    gbm  = report.gbm
+    ou   = report.ou
+    turb = report.turbulence
+
+    col_gbm, col_ou, col_turb = st.columns(3)
+
+    # ── GBM ──────────────────────────────────────────────────────────────
+    with col_gbm:
+        st.markdown(
+            '<div class="q-analytics-panel">'
+            '<div class="q-analytics-title">▸ GBM  —  MOUVEMENT BROWNIEN GÉOMÉTRIQUE</div>'
+            '<div class="q-eq">dS_t = μ·S_t·dt  +  σ·S_t·dW_t</div>',
+            unsafe_allow_html=True,
+        )
+        if gbm.valid:
+            mu_col  = COLOR_UP   if gbm.mu  >= 0 else COLOR_DOWN
+            sig_col = COLOR_AMBER if gbm.sigma > 0.25 else COLOR_UP
+            sig_inst = float(gbm.sigma_rolling[-1]) if len(gbm.sigma_rolling) > 0 else 0.0
+            var_inst = float(gbm.variance_window[-1]) if len(gbm.variance_window) > 0 else 0.0
             st.markdown(
-                f'<div class="metric-card turb">'
-                f'<div class="metric-label">σ Turbulence (N={TURBULENCE_WINDOW})</div>'
-                f'<div class="metric-value" style="color:{t_c};font-size:2.0rem;">'
-                f'{t_s}<span class="metric-unit">bar</span></div>'
-                f'<div class="metric-sub">{sub}</div></div>',
+                f'<div class="data-row"><span class="data-label">μ DRIFT (ann.)</span>'
+                f'<span style="color:{mu_col};font-family:{FONT_MONO};">{gbm.mu:+.6f}</span></div>'
+                f'<div class="data-row"><span class="data-label">σ VOLATILITY (ann.)</span>'
+                f'<span style="color:{sig_col};font-family:{FONT_MONO};">{gbm.sigma:.6f}</span></div>'
+                f'<div class="data-row"><span class="data-label">σ INSTANT (last win)</span>'
+                f'<span class="data-value">{sig_inst:.6f}</span></div>'
+                f'<div class="data-row"><span class="data-label">VAR WINDOW (last)</span>'
+                f'<span class="data-value">{var_inst:.8f}</span></div>'
+                f'<div class="data-row"><span class="data-label">WINDOW SIZE</span>'
+                f'<span class="data-value">{GBM_WINDOW} cycles</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<span style="color:#FF3C3C;font-size:0.75rem;">⚠ Insufficient data for GBM</span>',
+                unsafe_allow_html=True,
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── OU ───────────────────────────────────────────────────────────────
+    with col_ou:
+        r_css = {"EXPLOSIVE_COMPRESSION": "regime-compress",
+                 "RETURN_TO_REST":        "regime-relax",
+                 "NEUTRAL":               "regime-neutral"}.get(ou.regime, "regime-neutral")
+        st.markdown(
+            '<div class="q-analytics-panel">'
+            '<div class="q-analytics-title">▸ OU  —  RELAXATION ORNSTEIN-UHLENBECK</div>'
+            '<div class="q-eq">dX_t = θ·(μ − X_t)·dt  +  σ·dW_t</div>',
+            unsafe_allow_html=True,
+        )
+        if ou.valid:
+            st.markdown(
+                f'<div class="data-row"><span class="data-label">θ MEAN-REVERSION</span>'
+                f'<span class="data-value">{ou.theta:.6f}</span></div>'
+                f'<div class="data-row"><span class="data-label">μ_eq EQUILIBRIUM</span>'
+                f'<span class="data-value">{ou.mu_eq:.4f}</span></div>'
+                f'<div class="data-row"><span class="data-label">σ_ou DIFFUSION</span>'
+                f'<span class="data-value">{ou.sigma_ou:.6f}</span></div>'
+                f'<div class="data-row"><span class="data-label">T½ HALF-LIFE</span>'
+                f'<span class="data-value">{ou.half_life:.2f} periods</span></div>'
+                f'<div style="margin-top:10px;"><span class="{r_css}">{ou.regime}</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<span style="color:#FF3C3C;font-size:0.75rem;">'
+                '⚠ Non-stationary / insufficient data for OU</span>',
+                unsafe_allow_html=True,
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Turbulence ────────────────────────────────────────────────────────
+    with col_turb:
+        st.markdown(
+            '<div class="q-analytics-panel">'
+            '<div class="q-analytics-title">▸ FILTRE ANOMALIES  —  Δ²P ACCÉLÉRATION</div>'
+            f'<div class="q-eq">z_t = (Δ²S_t − μ_a) / σ_a  │  seuil ±{TURB_ACCEL_STD_THRESH}σ</div>',
+            unsafe_allow_html=True,
+        )
+        if turb.valid:
+            latest_z = float(turb.accel_zscore[-1]) if len(turb.accel_zscore) > 0 else 0.0
+            z_col    = COLOR_DOWN if abs(latest_z) > TURB_ACCEL_STD_THRESH else COLOR_UP
+            st.markdown(
+                f'<div class="data-row"><span class="data-label">LATEST z-score</span>'
+                f'<span style="color:{z_col};font-family:{FONT_MONO};">{latest_z:+.4f}</span></div>'
+                f'<div class="data-row"><span class="data-label">ANOMALY COUNT</span>'
+                f'<span style="color:{"#FF3C3C" if turb.anomaly_count > 0 else COLOR_UP};">'
+                f'{turb.anomaly_count}</span></div>'
+                f'<div class="data-row"><span class="data-label">THRESHOLD</span>'
+                f'<span class="data-value">±{TURB_ACCEL_STD_THRESH} σ</span></div>'
+                f'<div class="data-row"><span class="data-label">CALC LATENCY</span>'
+                f'<span class="data-value">{report.calc_ms:.3f} ms</span></div>',
+                unsafe_allow_html=True,
+            )
+            badge = (
+                '<span class="turb-badge">⚠ INSTABILITÉ TURBULENTE DÉTECTÉE</span>'
+                if turb.latest_flag
+                else '<span class="regime-relax">✓ FLUX NOMINAL</span>'
+            )
+            st.markdown(f'<div style="margin-top:10px;">{badge}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<span style="color:#FF3C3C;font-size:0.75rem;">'
+                '⚠ Insufficient data for turbulence filter</span>',
+                unsafe_allow_html=True,
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="q-divider-cyan"></div>', unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────────────────────
+def render_header() -> None:
+    c_title, c_badge = st.columns([3, 1])
+    with c_title:
+        st.markdown(
+            '<div class="quantum-title">⚛ XAU·QUANTUM·DASHBOARD</div>'
+            '<div class="quantum-subtitle">'
+            'KINETIC FLUID TELEMETRY  //  XAUUSD  //  GBM·OU·COORDS  v4.0 FINAL'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    with c_badge:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d  %H:%M:%S UTC")
+        st.markdown(
+            f'<div style="text-align:right; padding-top:10px;">'
+            f'<span class="quantum-badge">◉ LIVE</span><br>'
+            f'<span style="font-size:0.62rem; color:#00CC33;">{now}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# METRICS ROW
+# ─────────────────────────────────────────────────────────────────────────────
+def render_metrics(df: pd.DataFrame, report: FluidKineticsReport) -> None:
+    if df.empty:
+        st.warning("⚠  No telemetry data — check API key / connectivity")
+        return
+
+    last    = df["close"].iloc[-1]
+    prev    = df["close"].iloc[-2] if len(df) > 1 else last
+    chg     = last - prev
+    chg_pct = (chg / prev * 100) if prev != 0 else 0.0
+    hi      = df["high"].max()
+    lo      = df["low"].min()
+    spread  = round((df["high"].iloc[-1] - df["low"].iloc[-1]), 3)
+    rsi_val = df["rsi14"].iloc[-1] if "rsi14" in df.columns else float("nan")
+    atr_val = df["atr14"].iloc[-1] if "atr14" in df.columns else float("nan")
+
+    st.session_state["last_price"] = last
+    st.session_state["prev_price"] = prev
+
+    cols = st.columns(10)
+    data = [
+        ("LAST PRICE",   f"{last:,.3f}",      f"{chg:+.3f}"),
+        ("24H CHANGE",   f"{chg_pct:+.3f} %", None),
+        ("SESSION HIGH", f"{hi:,.3f}",         None),
+        ("SESSION LOW",  f"{lo:,.3f}",         None),
+        ("SPREAD",       f"{spread:.3f}",      None),
+        ("RSI · 14",     f"{rsi_val:.1f}" if not np.isnan(rsi_val) else "N/A", None),
+        ("ATR · 14",     f"{atr_val:.3f}" if not np.isnan(atr_val) else "N/A", None),
+        ("μ GBM",        f"{report.gbm.mu:+.5f}" if report.gbm.valid else "N/A", None),
+        ("θ OU",         f"{report.ou.theta:.5f}" if report.ou.valid else "N/A", None),
+        ("API LATENCY",  f"{st.session_state['api_latency_ms']:.0f} ms", None),
+    ]
+    for col, (label, val, delta) in zip(cols, data):
+        if delta is not None:
+            col.metric(label, val, delta)
+        else:
+            col.metric(label, val)
+
+    st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDE PANEL
+# ─────────────────────────────────────────────────────────────────────────────
+def render_side_panel(
+    df: pd.DataFrame,
+    report: FluidKineticsReport,
+    ac: ActionCoordinates = None,
+) -> None:
+    last = st.session_state["last_price"]
+    prev = st.session_state["prev_price"]
+
+    if df.empty:
+        st.plotly_chart(go.Figure(), use_container_width=True)
+        return
+
+    hi = df["high"].max()
+    lo = df["low"].min()
+
+    st.plotly_chart(
+        build_depth_gauge(last, prev, hi, lo),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
+
+    # ── Regime + turbulence badges ────────────────────────────────────────
+    if report.ou.valid:
+        r_css = {"EXPLOSIVE_COMPRESSION": "regime-compress",
+                 "RETURN_TO_REST":        "regime-relax",
+                 "NEUTRAL":               "regime-neutral"}.get(report.ou.regime, "regime-neutral")
+        st.markdown(
+            f'<div style="text-align:center;margin:6px 0;">'
+            f'<span class="{r_css}">{report.ou.regime}</span></div>',
+            unsafe_allow_html=True,
+        )
+    if report.turbulence.valid and report.turbulence.latest_flag:
+        st.markdown(
+            '<div style="text-align:center;margin:4px 0;">'
+            '<span class="turb-badge">⚠ TURBULENCE</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+
+    # ── Last 6 candles ────────────────────────────────────────────────────
+    st.markdown("**RECENT CANDLES**")
+    tail = df.tail(6)[["timestamp", "open", "close"]].copy()
+    tail["timestamp"] = tail["timestamp"].dt.strftime("%H:%M")
+    for _, row in tail.iloc[::-1].iterrows():
+        up    = row["close"] >= row["open"]
+        color = COLOR_UP if up else COLOR_DOWN
+        arrow = "▲" if up else "▼"
+        st.markdown(
+            f'<div class="data-row">'
+            f'<span class="data-label">{row["timestamp"]}</span>'
+            f'<span style="color:{color};">{arrow} {row["close"]:,.2f}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── GBM snapshot ──────────────────────────────────────────────────────
+    if report.gbm.valid:
+        st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+        st.markdown("**GBM SNAPSHOT**")
+        sig_inst = float(report.gbm.sigma_rolling[-1]) if len(report.gbm.sigma_rolling) > 0 else 0.0
+        for lbl, val in [
+            ("μ (ann)",   f"{report.gbm.mu:+.6f}"),
+            ("σ (ann)",   f"{report.gbm.sigma:.6f}"),
+            ("σ instant", f"{sig_inst:.6f}"),
+        ]:
+            st.markdown(
+                f'<div class="data-row"><span class="data-label">{lbl}</span>'
+                f'<span class="data-value">{val}</span></div>',
                 unsafe_allow_html=True,
             )
 
-        with c2:
-            if sr_live and not math.isnan(sr_live["k_last"]):
-                k_v = sr_live["k_last"]
-                k_c = (COLOR_CRITICAL if k_v >= STOCH_OVERBOUGHT
-                       else COLOR_NOMINAL if k_v <= STOCH_OVERSOLD
-                       else COLOR_TEXT_PRI)
-                r_map = {
-                    "overbought": ("SURPRESSION",  "regime-overbought"),
-                    "oversold":   ("DÉPRESSURISÉ", "regime-oversold"),
-                    "neutral":    ("NEUTRE",        "regime-neutral"),
-                }
-                rl, rc = r_map.get(sr_live["stoch_regime"], ("—", "regime-neutral"))
-            else:
-                k_v, k_c = None, COLOR_TEXT_MUT
-                rl, rc = "EN ATTENTE", "regime-neutral"
-            k_s = f"{k_v:.1f}" if k_v is not None else "—"
+    # ── OU snapshot ───────────────────────────────────────────────────────
+    if report.ou.valid:
+        st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+        st.markdown("**OU SNAPSHOT**")
+        for lbl, val in [
+            ("θ",     f"{report.ou.theta:.6f}"),
+            ("μ_eq",  f"{report.ou.mu_eq:.4f}"),
+            ("T½",    f"{report.ou.half_life:.2f} p"),
+            ("σ_ou",  f"{report.ou.sigma_ou:.6f}"),
+        ]:
             st.markdown(
-                f'<div class="metric-card stoch">'
-                f'<div class="metric-label">%K Oscillateur (N={STOCH_K_WINDOW})</div>'
-                f'<div class="metric-value" style="color:{k_c};font-size:2.0rem;">'
-                f'{k_s}<span class="metric-unit">%</span></div>'
-                f'<div class="metric-sub">'
-                f'<span class="stoch-regime {rc}">{rl}</span>'
-                f'</div></div>',
+                f'<div class="data-row"><span class="data-label">{lbl}</span>'
+                f'<span class="data-value">{val}</span></div>',
                 unsafe_allow_html=True,
             )
 
-        with c3:
-            if sr_live and not math.isnan(sr_live["d_last"]):
-                d_v = sr_live["d_last"]
-                d_c = (COLOR_CRITICAL if d_v >= STOCH_OVERBOUGHT
-                       else COLOR_NOMINAL if d_v <= STOCH_OVERSOLD
-                       else COLOR_STOCH_D)
-                d_s = f"{d_v:.1f}"
-                x_v = sr_live["k_last"] - d_v if not math.isnan(sr_live["k_last"]) else 0
-                cross = ("▲ BULLISH" if x_v > 2 else "▼ BEARISH" if x_v < -2 else "≈ CONV.")
-            else:
-                d_s, d_c, cross = "—", COLOR_TEXT_MUT, "EN ATTENTE"
+    # ── AC snapshot ───────────────────────────────────────────────────────
+    if ac is not None and ac.valid:
+        st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+        if ac.inhibited:
             st.markdown(
-                f'<div class="metric-card stoch">'
-                f'<div class="metric-label">%D Signal (SMA-{STOCH_D_SMOOTH})</div>'
-                f'<div class="metric-value" style="color:{d_c};font-size:2.0rem;">'
-                f'{d_s}<span class="metric-unit">%</span></div>'
-                f'<div class="metric-sub">{cross}</div></div>',
+                '<div style="text-align:center; margin:4px 0;">'
+                '<span class="turb-badge">⛔ SYSTÈME VERROUILLÉ</span></div>',
                 unsafe_allow_html=True,
             )
-
-        with c4:
-            if sr_live and sr_live["drift"]["sufficient_data"]:
-                dr  = sr_live["drift"]
-                sym = {"hausse": "↗", "baisse": "↘", "stable": "→"}.get(
-                    dr["drift_direction"], "→")
-                sgn = "+" if dr["drift_bar_per_period"] >= 0 else ""
-                rc2 = {"surpression_critique": COLOR_CRITICAL,
-                       "dépressurisation_lente": COLOR_WARNING,
-                       "nominal": COLOR_NOMINAL}.get(dr["regime"], COLOR_TEXT_PRI)
-                rl2 = {"surpression_critique": "SURPRESSION",
-                       "dépressurisation_lente": "DÉPRESSURIS.",
-                       "nominal": "NOMINAL"}.get(dr["regime"], "—")
-                dr_s = f"{sym} {sgn}{dr['drift_bar_per_period']:.4f}"
-                r2s  = f"R²={dr['r_squared']:.3f}"
-            else:
-                dr_s, rc2, rl2, r2s = "—", COLOR_TEXT_MUT, "EN ATTENTE", ""
+        else:
+            st.markdown("**COORD. D'ACTIONNEMENT**")
+            sig_css = {"LONG": "signal-long", "SHORT": "signal-short",
+                       "WAIT": "signal-wait"}.get(ac.direction, "signal-wait")
+            sig_lbl = {"LONG": "▲ LONG", "SHORT": "▼ SHORT",
+                       "WAIT": "◌ ATTENTE"}.get(ac.direction, "◌ ATTENTE")
             st.markdown(
-                f'<div class="metric-card drift">'
-                f'<div class="metric-label">Drift μ (bar/période)</div>'
-                f'<div class="metric-value" style="color:{rc2};font-size:1.7rem;">'
-                f'{dr_s}</div>'
-                f'<div class="metric-sub">{rl2}  {r2s}</div></div>',
+                f'<div style="text-align:center; margin:6px 0;">'
+                f'<span class="{sig_css}">{sig_lbl}</span></div>',
                 unsafe_allow_html=True,
             )
-
-    except Exception as exc_kpi:
-        st.warning(f"KPI stochastique temporairement indisponible : {exc_kpi}")
-
-    st.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  GRAPHIQUES STOCHASTIQUES (%K/%D + Turbulence σ + Drift GBM)
-    # ══════════════════════════════════════════════════════════════════════
-    try:
-        sr_l  = st.session_state.get("stoch_results")
-        df_g  = st.session_state["pressure_history_df"]
-
-        if sr_l is not None and len(df_g) >= MIN_ROWS_FOR_STOCHASTICS:
-            xg = df_g["timestamp"].dt.strftime("%H:%M:%S").tolist()
-            col_osc, col_turb = st.columns(2)
-
-            with col_osc:
-                st.markdown(
-                    f'<div class="metric-label" style="margin-bottom:4px;">'
-                    f'Oscillateur %K/%D (N={STOCH_K_WINDOW})</div>',
-                    unsafe_allow_html=True,
-                )
-                fig_osc = go.Figure()
-                fig_osc.add_hrect(y0=STOCH_OVERBOUGHT, y1=100,
-                                  fillcolor="rgba(255,58,58,0.08)", line_width=0)
-                fig_osc.add_hrect(y0=0, y1=STOCH_OVERSOLD,
-                                  fillcolor="rgba(0,229,160,0.06)", line_width=0)
-                fig_osc.add_trace(go.Scatter(
-                    x=xg, y=sr_l["pct_k"].tolist(), mode="lines", name="%K",
-                    line=dict(color=COLOR_STOCH_K, width=1.8)))
-                fig_osc.add_trace(go.Scatter(
-                    x=xg, y=sr_l["pct_d"].tolist(), mode="lines",
-                    name=f"%D(SMA-{STOCH_D_SMOOTH})",
-                    line=dict(color=COLOR_STOCH_D, width=1.4, dash="dash")))
-                for y_v, col, lbl in [
-                    (STOCH_OVERBOUGHT, COLOR_CRITICAL, f"OB {STOCH_OVERBOUGHT}"),
-                    (STOCH_OVERSOLD,   COLOR_NOMINAL,  f"OS {STOCH_OVERSOLD}"),
-                ]:
-                    fig_osc.add_hline(y=y_v, line_color=col, line_dash="dot",
-                                      line_width=0.8,
-                                      annotation_text=f" {lbl}",
-                                      annotation_font_color=col,
-                                      annotation_font_size=9)
-                fig_osc.update_layout(
-                    paper_bgcolor=COLOR_PANEL, plot_bgcolor=COLOR_PANEL,
-                    font=dict(family="Share Tech Mono, monospace",
-                              color=COLOR_TEXT_MUT, size=10),
-                    margin=dict(l=5, r=5, t=20, b=5), height=230,
-                    showlegend=True,
-                    legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=9),
-                                orientation="h", y=1.1),
-                    xaxis=dict(gridcolor=COLOR_BORDER, showgrid=True,
-                               zeroline=False, tickfont=dict(size=8)),
-                    yaxis=dict(gridcolor=COLOR_BORDER, showgrid=True,
-                               zeroline=False, range=[-5, 105], title="%"),
-                )
-                st.plotly_chart(fig_osc, use_container_width=True)
-
-            with col_turb:
-                st.markdown(
-                    f'<div class="metric-label" style="margin-bottom:4px;">'
-                    f'σ Turbulence (N={TURBULENCE_WINDOW}) + Drift GBM</div>',
-                    unsafe_allow_html=True,
-                )
-                fig_t = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                      row_heights=[0.6, 0.4],
-                                      vertical_spacing=0.06)
-                fig_t.add_trace(go.Scatter(
-                    x=xg, y=sr_l["turbulence_series"].tolist(),
-                    mode="lines", name="σ turb",
-                    line=dict(color=COLOR_TURBULENCE, width=1.6),
-                    fill="tozeroy", fillcolor="rgba(96,165,250,0.07)",
-                ), row=1, col=1)
-                fig_t.add_hline(y=TURBULENCE_INHIBIT_THRESHOLD,
-                                line_color=COLOR_INHIBIT, line_dash="dash",
-                                line_width=1.0, row=1, col=1,
-                                annotation_text=f" Inhibition {TURBULENCE_INHIBIT_THRESHOLD:.2f}",
-                                annotation_font_color=COLOR_INHIBIT,
-                                annotation_font_size=8)
-                pv = df_g["pressure_bar"].tolist()
-                fig_t.add_trace(go.Scatter(
-                    x=xg, y=pv, mode="lines", name="P réelle",
-                    line=dict(color=COLOR_ACCENT, width=1.2),
-                ), row=2, col=1)
-                dr2 = sr_l["drift"]
-                if dr2["sufficient_data"] and xg and pv:
-                    fig_t.add_trace(go.Scatter(
-                        x=[xg[-1], "N+1"],
-                        y=[pv[-1], dr2["p_projected_next"]],
-                        mode="lines+markers", name="Proj.μ",
-                        line=dict(color=COLOR_DRIFT, width=1.2, dash="dot"),
-                        marker=dict(size=5, color=COLOR_DRIFT),
-                    ), row=2, col=1)
-                fig_t.update_layout(
-                    paper_bgcolor=COLOR_PANEL, plot_bgcolor=COLOR_PANEL,
-                    font=dict(family="Share Tech Mono, monospace",
-                              color=COLOR_TEXT_MUT, size=10),
-                    margin=dict(l=5, r=5, t=20, b=5), height=230,
-                    showlegend=True,
-                    legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=9),
-                                orientation="h", y=1.08),
-                )
-                fig_t.update_xaxes(gridcolor=COLOR_BORDER, showgrid=True,
-                                   zeroline=False, tickfont=dict(size=8))
-                fig_t.update_yaxes(gridcolor=COLOR_BORDER, showgrid=True,
-                                   zeroline=False)
-                st.plotly_chart(fig_t, use_container_width=True)
-
-    except Exception as exc_stoch_chart:
-        st.warning(f"Graphique stochastique temporairement indisponible : {exc_stoch_chart}")
-
-    st.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  ANALYSE GBM DÉTAILLÉE + TABLEAU RÉCAPITULATIF OPÉRATEUR
-    # ══════════════════════════════════════════════════════════════════════
-    try:
-        sr_gbm = st.session_state.get("stoch_results")
-        if sr_gbm and sr_gbm["drift"]["sufficient_data"]:
-            dr3 = sr_gbm["drift"]
-            st.markdown(
-                '<div class="section-header">'
-                'Analyse GBM — Mouvement Brownien Géométrique'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            g1, g2, g3, g4, g5 = st.columns(5)
-            for col_g, lbl_g, val_g, unit_g in [
-                (g1, "μ log-normal",    f"{dr3['mu_log']:+.6f}",          "bar/pér."),
-                (g2, "σ réalisée GBM",  f"{dr3['sigma_realised']:.6f}",   "bar·√n"),
-                (g3, "P(N+1) projetée", f"{dr3['p_projected_next']:.3f}", PRESSURE_UNIT),
-                (g4, "R² Régression",   f"{dr3['r_squared']:.4f}",        ""),
-                (g5, "Échantillons",    f"{dr3['n_samples']}",             "pts"),
+            for lbl, val, color in [
+                ("ENTRY", f"{ac.entry:,.3f}", COLOR_UP),
+                ("NDT",   f"{ac.ndt:,.3f}",   COLOR_CYAN),
+                ("ERV",   f"{ac.erv:,.3f}",   COLOR_DOWN),
+                ("HEP",   f"{ac.hep:,.3f}",   COLOR_AMBER),
+                ("R/R",   f"{ac.rr_ratio:.3f}", COLOR_UP if ac.rr_ratio >= 1.5 else COLOR_AMBER),
             ]:
-                with col_g:
+                st.markdown(
+                    f'<div class="data-row">'
+                    f'<span class="data-label">{lbl}</span>'
+                    f'<span style="color:{color}; font-family:{FONT_MONO};">{val}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Error log ─────────────────────────────────────────────────────────
+    if st.session_state["error_log"]:
+        st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+        st.markdown("**SYSTEM LOG**")
+        for entry in st.session_state["error_log"][-6:][::-1]:
+            st.markdown(
+                f'<div style="font-size:0.64rem;color:#FF3C3C;'
+                f'font-family:Share Tech Mono,monospace;">{entry}</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Tick + latency ────────────────────────────────────────────────────
+    st.markdown('<div class="q-divider"></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="data-row"><span class="data-label">TICK COUNT</span>'
+        f'<span class="data-value">{st.session_state["tick_count"]}'
+        f'<span class="blink">_</span></span></div>'
+        f'<div class="data-row"><span class="data-label">CALC LATENCY</span>'
+        f'<span class="data-value">{report.calc_ms:.3f} ms</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FRAGMENT  —  live refresh every REFRESH_SECONDS
+# ─────────────────────────────────────────────────────────────────────────────
+@st.fragment(run_every=REFRESH_SECONDS)
+def live_dashboard() -> None:
+    """
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║  LIVE DASHBOARD FRAGMENT  —  XAU-QUANTUM  v4.0  FINAL              ║
+    ║  Re-executes every REFRESH_SECONDS without full-page reload.        ║
+    ║                                                                      ║
+    ║  Resilience contract                                                 ║
+    ║  ─────────────────                                                   ║
+    ║  • Every pipeline step is wrapped in an isolated try/except.        ║
+    ║  • On API failure → "RE-CONNEXION AU CAPTEUR" overlay.              ║
+    ║  • On any calc failure → last valid cache is preserved and reused.  ║
+    ║  • On any render failure → inline amber warning badge.              ║
+    ║  • The fragment NEVER raises to the Streamlit runtime.              ║
+    ║                                                                      ║
+    ║  Execution pipeline per tick                                         ║
+    ║  ──────────────────────────                                          ║
+    ║  1.  fetch_quantum_telemetry (1M + 5M)                              ║
+    ║  2.  enrich_dataframe        (EMA/RSI/MACD/BB/ATR/Stoch)            ║
+    ║  3.  analyze_fluid_kinetics  (GBM + OU + Turbulence)                ║
+    ║  4.  generate_action_coordinates (ENTRY/NDT/ERV/HEP + inhibitor)   ║
+    ║  5.  render_metrics          (10-col metric bar)                     ║
+    ║  6.  render_analytics_panel  (GBM/OU/Turbulence summary)            ║
+    ║  7.  render_action_coordinates (4-threshold actuation panel)        ║
+    ║  8.  7 chart tabs  +  side panel                                    ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+    """
+    tick = st.session_state["tick_count"] + 1
+    st.session_state["tick_count"] = tick
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 1 — FETCH  (API call — most likely failure point)
+    # ══════════════════════════════════════════════════════════════════════
+    df_1m = pd.DataFrame()
+    df_5m = pd.DataFrame()
+    _api_ok = True
+
+    try:
+        df_1m_raw = fetch_quantum_telemetry(INTERVAL_1M)
+        df_5m_raw = fetch_quantum_telemetry(INTERVAL_5M)
+    except Exception as exc:
+        _log_error(f"[FETCH FATAL] {exc}")
+        df_1m_raw = pd.DataFrame()
+        df_5m_raw = pd.DataFrame()
+        _api_ok   = False
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 2 — ENRICH  (indicators computation)
+    # ══════════════════════════════════════════════════════════════════════
+    try:
+        if df_1m_raw.empty:
+            if not st.session_state["kline_cache_1m"].empty:
+                df_1m = st.session_state["kline_cache_1m"]
+            else:
+                _api_ok = False
+        else:
+            df_1m = enrich_dataframe(df_1m_raw)
+            st.session_state["kline_cache_1m"] = df_1m
+
+        if df_5m_raw.empty:
+            if not st.session_state["kline_cache_5m"].empty:
+                df_5m = st.session_state["kline_cache_5m"]
+        else:
+            df_5m = enrich_dataframe(df_5m_raw)
+            st.session_state["kline_cache_5m"] = df_5m
+    except Exception as exc:
+        _log_error(f"[ENRICH ERR] {exc}")
+        df_1m = st.session_state.get("kline_cache_1m", pd.DataFrame())
+        df_5m = st.session_state.get("kline_cache_5m", pd.DataFrame())
+
+    # ── Reconnection overlay when no data at all ──────────────────────────
+    if df_1m.empty and not _api_ok:
+        _reconnect_ui(
+            reason="Signal AllTick non disponible — tentative en cours",
+            retry=tick,
+        )
+        return
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 3 — STOCHASTIC ANALYTICAL ENGINE
+    # ══════════════════════════════════════════════════════════════════════
+    try:
+        report: FluidKineticsReport = analyze_fluid_kinetics(df_1m)
+        st.session_state["kinetics_cache"] = report
+    except Exception as exc:
+        _log_error(f"[KINETICS ERR] {exc}")
+        report = st.session_state.get("kinetics_cache", FluidKineticsReport())
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 4 — ACTION COORDINATE ENGINE
+    # ══════════════════════════════════════════════════════════════════════
+    try:
+        ac: ActionCoordinates = generate_action_coordinates(df_1m, report)
+        st.session_state["action_coords"] = ac
+    except Exception as exc:
+        _log_error(f"[COORD ERR] {exc}")
+        ac = st.session_state.get("action_coords", ActionCoordinates())
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 5 — METRICS ROW
+    # ══════════════════════════════════════════════════════════════════════
+    try:
+        render_metrics(df_1m, report)
+    except Exception as exc:
+        _log_error(f"[METRICS ERR] {exc}")
+        st.markdown(
+            f'<div class="step-error">⚠ METRICS — RE-CONNEXION AU CAPTEUR  [{exc}]</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 6 — ANALYTICS PANEL  (GBM / OU / Turbulence)
+    # ══════════════════════════════════════════════════════════════════════
+    try:
+        render_analytics_panel(report)
+    except Exception as exc:
+        _log_error(f"[ANALYTICS ERR] {exc}")
+        st.markdown(
+            f'<div class="step-error">⚠ ANALYTICS — RE-CONNEXION AU CAPTEUR  [{exc}]</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 7 — ACTION COORDINATES PANEL  (ENTRY / NDT / ERV / HEP)
+    # ══════════════════════════════════════════════════════════════════════
+    try:
+        render_action_coordinates(ac)
+    except Exception as exc:
+        _log_error(f"[COORD RENDER ERR] {exc}")
+        st.markdown(
+            f'<div class="step-error">⚠ COORDONNÉES — RE-CONNEXION AU CAPTEUR  [{exc}]</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 8 — CHARTS + SIDE PANEL
+    # ══════════════════════════════════════════════════════════════════════
+    col_charts, col_side = st.columns([3, 1])
+
+    with col_charts:
+        try:
+            tab_1m, tab_5m, tab_coord, tab_stoch, tab_gbm, tab_ou, tab_turb = st.tabs([
+                "● 1M FLUX",
+                "● 5M FLUX",
+                "⬡ COORDINATES",
+                "◈ STOCHASTIC",
+                "◈ GBM KINETICS",
+                "◈ OU RELAXATION",
+                "⚠ TURBULENCE",
+            ])
+        except Exception as exc:
+            _log_error(f"[TABS ERR] {exc}")
+            _reconnect_ui("Erreur de rendu des onglets", tick)
+            with col_side:
+                try:
+                    render_side_panel(df_1m, report, ac)
+                except Exception:
+                    pass
+            return
+
+        # ── Tab 1M ─────────────────────────────────────────────────────
+        with tab_1m:
+            try:
+                if not df_1m.empty:
+                    st.plotly_chart(
+                        _safe_chart(build_main_chart, df_1m, "XA·UUSD  KINETIC PRESSURE  [1M]"),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                else:
+                    _reconnect_ui("Flux 1M — données indisponibles", tick)
+            except Exception as exc:
+                _log_error(f"[TAB 1M] {exc}")
+                _reconnect_ui(str(exc), tick)
+
+        # ── Tab 5M ─────────────────────────────────────────────────────
+        with tab_5m:
+            try:
+                if not df_5m.empty:
+                    st.plotly_chart(
+                        _safe_chart(build_main_chart, df_5m, "XA·UUSD  KINETIC PRESSURE  [5M]"),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                else:
+                    _reconnect_ui("Flux 5M — données indisponibles", tick)
+            except Exception as exc:
+                _log_error(f"[TAB 5M] {exc}")
+                _reconnect_ui(str(exc), tick)
+
+        # ── Tab Coordinates ────────────────────────────────────────────
+        with tab_coord:
+            try:
+                if ac.inhibited:
                     st.markdown(
-                        f'<div class="metric-card" style="padding:12px 14px;">'
-                        f'<div class="metric-label">{lbl_g}</div>'
-                        f'<div class="metric-value" style="font-size:1.4rem;">'
-                        f'{val_g}<span class="metric-unit">{unit_g}</span></div>'
-                        f'</div>',
+                        '<div class="inhibit-overlay">'
+                        '<div class="inhibit-title">⛔ SYSTÈME VERROUILLÉ</div>'
+                        '<div class="inhibit-sub">Turbulence hors-limite — '
+                        'coordonnées neutralisées</div>'
+                        '</div>',
                         unsafe_allow_html=True,
                     )
+                elif not df_1m.empty and ac.valid:
+                    st.plotly_chart(
+                        _safe_chart(build_coord_chart, df_1m, ac),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                    st.plotly_chart(
+                        _safe_chart(build_stochastic_chart, df_1m, ac),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                else:
+                    _reconnect_ui("Coordinate engine — accumulation des données", tick)
+            except Exception as exc:
+                _log_error(f"[TAB COORD] {exc}")
+                _reconnect_ui(str(exc), tick)
 
-    except Exception as exc_gbm:
-        st.warning(f"Analyse GBM temporairement indisponible : {exc_gbm}")
+        # ── Tab Stochastic ─────────────────────────────────────────────
+        with tab_stoch:
+            try:
+                if not df_1m.empty:
+                    st.plotly_chart(
+                        _safe_chart(build_stochastic_chart, df_1m, ac),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        st.plotly_chart(
+                            _safe_chart(build_rsi_spark, df_1m),
+                            use_container_width=True, config={"displayModeBar": False},
+                        )
+                    with sc2:
+                        st.plotly_chart(
+                            _safe_chart(build_volatility_heatmap, df_1m),
+                            use_container_width=True, config={"displayModeBar": False},
+                        )
+                else:
+                    _reconnect_ui("Oscillateur stochastique — RE-CONNEXION", tick)
+            except Exception as exc:
+                _log_error(f"[TAB STOCH] {exc}")
+                _reconnect_ui(str(exc), tick)
 
-    # ── Tableau récapitulatif opérateur ────────────────────────────────────
-    try:
-        th_tbl = st.session_state.get("intervention_thresholds")
-        if th_tbl and not th_tbl["inhibited"]:
-            st.markdown(
-                '<div class="metric-label" style="margin:14px 0 8px;">'
-                'Tableau récapitulatif — Coordonnées d\'actionnement panneau vannes</div>',
-                unsafe_allow_html=True,
-            )
-            proc_t    = th_tbl["procedure"]
-            proc_css_t= {"IN":"proc-in","OUT":"proc-out","HOLD":"proc-hold"}.get(
-                proc_t, "proc-hold")
-            p_curr_s  = (f"{float(st.session_state['pressure_history_df']['pressure_bar'].iloc[-1]):.3f}"
-                         if len(st.session_state["pressure_history_df"]) > 0 else "—")
-            sr_t      = st.session_state.get("stoch_results")
-            vol_s     = (f"{sr_t['turbulence_last']:.4f}"
-                         if sr_t and not math.isnan(sr_t["turbulence_last"]) else "—")
+        # ── Tab GBM ────────────────────────────────────────────────────
+        with tab_gbm:
+            try:
+                if not df_1m.empty and report.gbm.valid:
+                    st.plotly_chart(
+                        _safe_chart(build_gbm_sigma_chart, df_1m, report.gbm),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        st.plotly_chart(
+                            _safe_chart(build_rsi_spark, df_1m),
+                            use_container_width=True, config={"displayModeBar": False},
+                        )
+                    with sc2:
+                        st.plotly_chart(
+                            _safe_chart(build_volatility_heatmap, df_1m),
+                            use_container_width=True, config={"displayModeBar": False},
+                        )
+                else:
+                    _reconnect_ui("GBM engine — accumulation des données cinétiques", tick)
+            except Exception as exc:
+                _log_error(f"[TAB GBM] {exc}")
+                _reconnect_ui(str(exc), tick)
 
-            rows_html = ""
-            for code_t, lbl_t, val_t, color_t, css_t, formula_t in [
-                ("ZP",  "Zeroing Point — Entry",          th_tbl["zeroing_point"], COLOR_ZP,  "th-zp",
-                 f"P ± (σ×{NDT_VOLATILITY_RATIO})"),
-                ("NDT", "Décompression Nominale — T.P.",  th_tbl["ndt"],           COLOR_NDT, "th-ndt",
-                 f"ZP ± (σ×{NDT_VOLATILITY_RATIO})"),
-                ("ERV", "Soupape d'Urgence — Stop Loss",  th_tbl["erv"],           COLOR_ERV, "th-erv",
-                 f"P ± (σ×{ERV_SAFETY_MULTIPLIER})"),
-                ("HEP", "Équilibre Hydrostatique — B.E.", th_tbl["hep"],           COLOR_HEP, "th-hep",
-                 f"ZP ± {HEP_FRICTION_OFFSET_BAR} bar"),
-            ]:
-                rows_html += (
-                    f'<tr>'
-                    f'<td><span class="{css_t}">[{code_t}]</span></td>'
-                    f'<td style="color:{COLOR_TEXT_MUT};">{lbl_t}</td>'
-                    f'<td style="color:{color_t};font-weight:bold;">'
-                    f'{val_t:.4f} bar</td>'
-                    f'<td style="color:{COLOR_TEXT_MUT};">{formula_t}</td>'
-                    f'<td><span class="action-proc-badge {proc_css_t}" '
-                    f'style="font-size:0.62rem;">{proc_t}</span></td>'
-                    f'</tr>'
-                )
+        # ── Tab OU ─────────────────────────────────────────────────────
+        with tab_ou:
+            try:
+                if not df_1m.empty and report.ou.valid:
+                    st.plotly_chart(
+                        _safe_chart(build_ou_chart, df_1m, report.ou),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                else:
+                    _reconnect_ui(
+                        "OU engine — processus non-stationnaire ou données insuffisantes",
+                        tick,
+                    )
+            except Exception as exc:
+                _log_error(f"[TAB OU] {exc}")
+                _reconnect_ui(str(exc), tick)
 
-            st.markdown(
-                f'<table class="threshold-table">'
-                f'<thead><tr>'
-                f'<th>Code</th><th>Mécanisme</th>'
-                f'<th>Valeur absolue</th><th>Formule</th><th>Proc.</th>'
-                f'</tr></thead><tbody>'
-                f'{rows_html}'
-                f'<tr style="border-top:2px solid {COLOR_BORDER};">'
-                f'<td colspan="2" style="color:{COLOR_TEXT_MUT};">'
-                f'P courante / σ_turb / Seuil inhibition</td>'
-                f'<td style="font-weight:bold;">{p_curr_s} bar</td>'
-                f'<td style="color:{COLOR_TEXT_MUT};">{vol_s} bar</td>'
-                f'<td style="color:{COLOR_TEXT_MUT};">'
-                f'⚠ {TURBULENCE_INHIBIT_THRESHOLD:.2f} bar</td>'
-                f'</tr>'
-                f'</tbody></table>',
-                unsafe_allow_html=True,
-            )
-        elif th_tbl and th_tbl["inhibited"]:
-            st.error(
-                f"🛑 **{_INHIBIT_STATE_MSG}**\n\n"
-                f"{th_tbl['inhibit_reason']}\n\n"
-                f"Inhibitions déclenchées cette session : "
-                f"**{st.session_state['inhibit_count']}**"
-            )
+        # ── Tab Turbulence ─────────────────────────────────────────────
+        with tab_turb:
+            try:
+                if not df_1m.empty and report.turbulence.valid:
+                    st.plotly_chart(
+                        _safe_chart(build_turbulence_chart, df_1m, report.turbulence),
+                        use_container_width=True, config={"displayModeBar": False},
+                    )
+                else:
+                    _reconnect_ui("Filtre turbulence — accumulation des données", tick)
+            except Exception as exc:
+                _log_error(f"[TAB TURB] {exc}")
+                _reconnect_ui(str(exc), tick)
 
-    except Exception as exc_tbl:
-        st.warning(f"Tableau d'actionnement temporairement indisponible : {exc_tbl}")
-
-    st.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  TABLEAU HISTORIQUE BRUT ENRICHI (20 dernières mesures)
-    # ══════════════════════════════════════════════════════════════════════
-    try:
-        df_raw = st.session_state["pressure_history_df"]
-        if len(df_raw) > 0:
-            st.markdown(
-                '<div class="metric-label" style="margin-bottom:6px;">'
-                'Mesures brutes enrichies — 20 derniers enregistrements</div>',
-                unsafe_allow_html=True,
-            )
-            sr_raw   = st.session_state.get("stoch_results")
-            disp     = df_raw.tail(20).copy()
-
-            if sr_raw and len(sr_raw["pct_k"]) == len(df_raw):
-                disp["σ Turb."] = sr_raw["turbulence_series"].iloc[-len(disp):].values
-                disp["%K"]      = sr_raw["pct_k"].iloc[-len(disp):].values
-                disp["%D"]      = sr_raw["pct_d"].iloc[-len(disp):].values
-
-            disp["timestamp"] = disp["timestamp"].dt.strftime("%H:%M:%S")
-            rename_map = {
-                "timestamp":      "Horodatage",
-                "pressure_bar":   f"P ({PRESSURE_UNIT})",
-                "status":         "Statut",
-                "delta_bar":      "Δ bar",
-                "rolling_avg_5":  "Moy.5",
-                "api_latency_ms": "Lat.ms",
-            }
-            disp = disp.rename(columns=rename_map)
-            disp = disp.drop(columns=[c for c in ["sensor_id","rolling_std_5"]
-                                      if c in disp.columns])
-
-            def _style_s(v):
-                return (f"color:{'#00E5A0' if v=='nominal' else '#FFB830' if v=='warning' else '#FF3A3A'};"
-                        f"font-weight:bold;")
-
-            fmt = {f"P ({PRESSURE_UNIT})":"{:.3f}", "Δ bar":"{:+.3f}",
-                   "Moy.5":"{:.3f}", "Lat.ms":"{:.1f}"}
-            if "σ Turb." in disp.columns:
-                fmt.update({"σ Turb.":"{:.4f}", "%K":"{:.1f}", "%D":"{:.1f}"})
-
-            styled = (disp.style
-                      .applymap(_style_s, subset=["Statut"])
-                      .format(fmt, na_rep="—")
-                      .set_properties(**{
-                          "background-color": COLOR_PANEL,
-                          "color": COLOR_TEXT_PRI,
-                          "border-color": COLOR_BORDER,
-                          "font-size": "0.74rem",
-                          "font-family": "'Share Tech Mono', monospace",
-                      }))
-            st.dataframe(styled, use_container_width=True, height=310)
-
-    except Exception as exc_raw:
-        st.warning(f"Tableau brut temporairement indisponible : {exc_raw}")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  §11  PANNEAU DE CONTRÔLE MANUEL (hors fragment — déclenché par l'utilisateur)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _render_manual_control_panel() -> None:
-    """
-    Panneau de contrôle manuel — rendu hors du fragment.
-    Permet à l'ingénieur de déclencher une acquisition unique ou d'activer
-    le monitoring continu indépendamment du cycle @st.fragment.
-    """
-    st.markdown(
-        '<div class="section-header">Contrôle Manuel — Acquisition Hors Cycle Fragment</div>',
-        unsafe_allow_html=True,
-    )
-
-    ca, cb, cc = st.columns([1, 1, 2])
-
-    with ca:
-        if st.button("▶  ACQUISITION UNIQUE", key="btn_manual_single"):
-            with st.spinner("Interrogation API XA-UUSD…"):
-                try:
-                    result = run_full_pipeline()
-                    if result is None:
-                        st.warning("Acquisition échouée — voir le journal.")
-                except Exception as exc_manual:
-                    st.error(f"Exception acquisition : {exc_manual}")
-            st.rerun()
-
-    with cb:
-        monitoring = st.session_state["monitoring_active"]
-        lbl_mon    = "⏹  STOP MONITORING" if monitoring else "⏵  MONITORING CONTINU"
-        if st.button(lbl_mon, key="btn_monitoring"):
-            st.session_state["monitoring_active"] = not monitoring
-            st.rerun()
-
-    with cc:
-        if st.session_state["monitoring_active"]:
-            st.markdown(
-                f'<div class="status-badge status-nominal" style="margin-top:6px;">'
-                f'● MONITORING ACTIF — Intervalle {POLL_INTERVAL_SECONDS}s '
-                f'(+ fragment {FRAGMENT_INTERVAL})'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-    # Boucle monitoring continu (synchrone — déclenche des reruns)
-    if st.session_state["monitoring_active"]:
+    # ── Side panel ────────────────────────────────────────────────────────
+    with col_side:
         try:
-            run_full_pipeline()
-        except Exception as exc_mon:
-            _append_event_log("err", f"Monitoring : {exc_mon}")
-        time.sleep(POLL_INTERVAL_SECONDS)
-        st.rerun()
+            render_side_panel(df_1m, report, ac)
+        except Exception as exc:
+            _log_error(f"[SIDE PANEL ERR] {exc}")
+            st.markdown(
+                f'<div class="step-error">⚠ SIDE PANEL — RE-CONNEXION  [{exc}]</div>',
+                unsafe_allow_html=True,
+            )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  §12  POINT D'ENTRÉE PRINCIPAL — main()
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    """
-    Fonction principale — Version FINALE DE DÉPLOIEMENT v4.0.0.
-
-    Architecture d'exécution :
-    ┌─────────────────────────────────────────────────────────────┐
-    │  RENDU STATIQUE (1 seule fois au chargement / rerun complet) │
-    │  • set_page_config                                           │
-    │  • CSS injection                                             │
-    │  • initialize_session_state                                  │
-    │  • _render_static_header                                     │
-    │  • _render_manual_control_panel                              │
-    │  • _render_static_sidebar                                    │
-    ├─────────────────────────────────────────────────────────────┤
-    │  FRAGMENT LIVE @st.fragment(run_every="5s")                  │
-    │  • live_control_dashboard()  ← toutes les 5 secondes        │
-    │    ├─ Acquisition API (try/except réseau)                    │
-    │    ├─ Calcul stochastique (try/except)                       │
-    │    ├─ Calcul seuils d'intervention (try/except)              │
-    │    ├─ Panneau ACTION / PAUSE / HOLD                          │
-    │    ├─ 5 st.metric : P | ZP(Entry) | NDT(TP) | ERV(SL) | HEP(BE) │
-    │    ├─ Graphique pression + niveaux ZP/NDT/ERV/HEP            │
-    │    ├─ KPI stochastique + graphiques %K/%D / σ / drift        │
-    │    ├─ Analyse GBM (μ, σ, R², P(N+1))                        │
-    │    └─ Tableau récapitulatif opérateur + historique brut      │
-    └─────────────────────────────────────────────────────────────┘
-    """
-    # ── Configuration de la page ──────────────────────────────────────────
-    st.set_page_config(
-        page_title = "Système de Contrôle Hydrodynamique XA-UUSD",
-        page_icon  = "⬡",
-        layout     = "wide",
-        initial_sidebar_state = "expanded",
-        menu_items = {
-            "Get Help":     None,
-            "Report a bug": None,
-            "About": (
-                "**XA-UUSD Hydrodynamic Control Dashboard** — v4.0.0 FINAL\n\n"
-                "Télémétrie asynchrone · Stochastique GBM/Kolmogorov · "
-                "Seuils d'intervention ZP/NDT/ERV/HEP · "
-                "Interface fragmentée @st.fragment (5 s)\n\n"
-                "Usage strictement industriel."
-            ),
-        },
-    )
-
-    # ── Injection CSS ─────────────────────────────────────────────────────
-    st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
-
-    # ── Initialisation session state ──────────────────────────────────────
-    initialize_session_state()
-
-    # ── Header statique ───────────────────────────────────────────────────
-    _render_static_header()
-    st.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    # ── Panneau de contrôle manuel (hors fragment) ─────────────────────────
-    _render_manual_control_panel()
-    st.markdown('<hr class="xa-divider">', unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  LIVE CONTROL DASHBOARD — Fragment auto-refresh toutes les 5 secondes
-    # ══════════════════════════════════════════════════════════════════════
-    live_control_dashboard()
-
-    # ── Sidebar statique ──────────────────────────────────────────────────
-    _render_static_sidebar()
+    render_header()
+    live_dashboard()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
